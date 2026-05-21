@@ -2,19 +2,22 @@
 
 [![CI](https://github.com/promisszn/soroban-amm/workflows/CI/badge.svg)](https://github.com/promisszn/soroban-amm/actions)
 
-A constant-product Automated Market Maker (AMM) built as a Soroban smart contract on the Stellar blockchain. It implements the classic `x * y = k` bonding curve model — the same design used by Uniswap v2 — providing decentralized token swaps and liquidity provisioning.
+A full-stack AMM protocol built on Stellar's Soroban smart contract platform. It ships a battle-tested V2 constant-product pool today and is actively building a V3-style concentrated liquidity engine — the only open-source implementation of its kind on Stellar.
 
 ---
 
 ## Table of Contents
 
+- [Why This Project](#why-this-project)
 - [Overview](#overview)
 - [Architecture](#architecture)
 - [Contracts](#contracts)
   - [AMM Pool Contract](#amm-pool-contract)
   - [LP Token Contract](#lp-token-contract)
   - [Factory Contract](#factory-contract)
+  - [Governance Contract](#governance-contract)
   - [TWAP Consumer Contract](#twap-consumer-contract)
+  - [Concentrated Liquidity Contract](#concentrated-liquidity-contract)
 - [Math & Formulas](#math--formulas)
 - [Getting Started](#getting-started)
   - [Prerequisites](#prerequisites)
@@ -37,37 +40,65 @@ A constant-product Automated Market Maker (AMM) built as a Soroban smart contrac
 
 ---
 
+## Why This Project
+
+Stellar has fast finality (~5 seconds), sub-cent fees, and a large existing user base around stablecoins and remittances. Its native DEX is order-book based — a constant-product AMM is a fundamentally different and more composable liquidity model that fills a real gap in the ecosystem.
+
+Several AMM protocols already exist on Stellar, but each has meaningful limitations:
+
+| Protocol | Pool model | Governance | Open source |
+|---|---|---|---|
+| **Soroswap** | V2 constant-product only | None | Yes |
+| **Phoenix** | V2 + stable pools | None | Yes |
+| **Sushi** | Concentrated liquidity | None | No (Sushi mainline) |
+| **Aquarius** | Governance layer only | AQUA token | Partial |
+| **This project** | V2 now + V3 CL in progress | On-chain, LP-token-governed | Yes |
+
+What makes this project different:
+
+- **Concentrated liquidity (V3) in development** — the only open-source Soroban implementation targeting tick-based range positions, the same capital-efficiency model pioneered by Uniswap v3. LPs can earn more fees by concentrating capital in active price ranges instead of spreading it across an infinite curve.
+- **On-chain governance** — LP token holders can propose and vote on fee changes directly through a governance contract, with configurable quorum, voting windows, minimum stake, vote locking, and proposal cancellation. No protocol is governed off-chain or by a single admin key.
+- **TWAP oracle** — a manipulation-resistant time-weighted average price feed that other protocols (lending markets, derivatives) can build on top of, without needing a separate oracle network.
+- **Flash loans** — single-transaction borrowing from pool reserves with a configurable fee, enabling arbitrage, collateral swaps, and liquidation bots.
+- **Full composability** — every contract in the protocol is independently deployable and interoperable. The factory, governance, and TWAP contracts can be used with any pool, not just the ones deployed here.
+
+---
+
 ## Overview
 
-This AMM lets users:
+The protocol lets users:
 
-- **Provide liquidity** — deposit two tokens into a pool and receive LP (Liquidity Provider) tokens representing their share.
-- **Swap tokens** — exchange one pool token for the other at a price determined by the constant-product formula.
-- **Redeem liquidity** — burn LP tokens to withdraw a proportional share of the pool's reserves.
-
-All operations include slippage protection parameters. Fees are configurable in basis points at deployment and are distributed to liquidity providers by growing the pool reserves.
+- **Provide liquidity** — deposit two tokens into a pool and receive LP tokens representing their share of the reserves (V2), or mint a tick-range position for concentrated capital efficiency (V3).
+- **Swap tokens** — exchange one pool token for the other at a price determined by the pool's invariant, with slippage protection.
+- **Redeem liquidity** — burn LP tokens (V2) or close a position (V3) to withdraw a proportional share of reserves plus accrued fees.
+- **Govern the protocol** — stake LP tokens to propose fee changes; vote on active proposals; execute passing proposals on-chain.
+- **Access price data** — query a TWAP oracle for a manipulation-resistant average price over any window.
 
 ---
 
 ## Architecture
 
-The project is a Cargo workspace with four contracts:
+The project is a Cargo workspace with five contracts:
 
 ```
 soroban-amm/
-├── Cargo.toml                  # Workspace root
+├── Cargo.toml                        # Workspace root
 └── contracts/
-    ├── amm/                    # Core AMM pool contract
+    ├── amm/                          # V2 constant-product AMM pool
     │   └── src/lib.rs
-    ├── token/                  # SEP-41 LP token contract
+    ├── token/                        # SEP-41 LP token contract
     │   └── src/lib.rs
-    ├── factory/                # Pool factory contract
+    ├── factory/                      # Pool factory and registry
     │   └── src/lib.rs
-    └── twap_consumer/          # Example TWAP consumer integration contract
+    ├── governance/                   # On-chain LP governance
+    │   └── src/lib.rs
+    ├── twap_consumer/                # TWAP oracle consumer
+    │   └── src/lib.rs
+    └── concentrated_liquidity/       # V3-style tick-based AMM (in progress)
         └── src/lib.rs
 ```
 
-The AMM contract depends on the token contract. When liquidity is added or removed, the AMM calls the LP token contract to mint or burn shares on behalf of the provider. The factory contract depends on both AMM and token: it deploys and initialises them as a pair when a new pool is created.
+The V2 AMM contract depends on the token contract — adding or removing liquidity mints or burns LP shares via the token contract. The factory deploys and initialises an AMM + LP token pair in a single transaction. The governance contract holds a reference to a pool and allows LP token holders to vote on parameter changes. The TWAP consumer reads cumulative price state from any AMM pool. The concentrated liquidity contract is standalone — it does not use the LP token and manages positions internally.
 
 ---
 
@@ -101,6 +132,19 @@ The AMM contract depends on the token contract. When liquidity is added or remov
 | `Balance(Address)` | Persistent | `i128` | Individual user share balance |
 | `Allowance(Address, Address)` | Persistent | `i128` | Third-party spending allowance |
 
+### Concentrated Liquidity Contract
+
+| Key | Storage Tier | Type | Description |
+|---|---|---|---|
+| `TokenA` | Instance | `Address` | First pool asset |
+| `TokenB` | Instance | `Address` | Second pool asset |
+| `FeeBps` | Instance | `i128` | Pool fee in basis points |
+| `CurrentTick` | Instance | `i32` | Active tick index |
+| `FeeGrowthGlobalA` | Instance | `i128` | Cumulative fee per liquidity unit for token A |
+| `FeeGrowthGlobalB` | Instance | `i128` | Cumulative fee per liquidity unit for token B |
+| `ActiveLiquidity` | Instance | `i128` | Total liquidity active at the current tick |
+| `Position(Address, i32, i32)` | Instance | `Position` | Per-user position keyed by `(owner, lower_tick, upper_tick)` |
+
 ---
 
 ## Upgrade Considerations
@@ -125,6 +169,7 @@ The AMM contract depends on the token contract. When liquidity is added or remov
 | `FeeBps` | `i128` | Swap fee in basis points (e.g. `30` = 0.30%) |
 | `Paused` | `bool` | Emergency circuit breaker state |
 | `FlashLoanFeeBps` | `i128` | Flash-loan fee in basis points; defaults to `FeeBps` |
+
 ### AMM Pool Contract
 
 Located in [contracts/amm/src/lib.rs](contracts/amm/src/lib.rs).
@@ -132,20 +177,30 @@ Located in [contracts/amm/src/lib.rs](contracts/amm/src/lib.rs).
 | Function | Description |
 |---|---|
 | `initialize(token_a, token_b, lp_token, fee_bps)` | One-time pool setup |
+| `initialize_with_flash_loan_fee(token_a, token_b, lp_token, fee_bps, flash_loan_fee_bps)` | One-time pool setup with a distinct flash-loan fee |
 | `pause(admin)` | Pause state-changing pool operations; requires `admin` auth |
 | `unpause(admin)` | Resume state-changing pool operations; requires `admin` auth |
 | `is_paused() → bool` | Read the current pause state |
-| `initialize_with_flash_loan_fee(token_a, token_b, lp_token, fee_bps, flash_loan_fee_bps)` | One-time pool setup with a distinct flash-loan fee |
-| `flash_loan(receiver, token, amount, data) -> fee` | Borrow pool reserves and repay within the receiver callback |
-| `add_liquidity(provider, amount_a, amount_b, min_shares) → shares` | Deposit tokens, receive LP shares |
-| `remove_liquidity(provider, shares, min_a, min_b) → (a, b)` | Burn LP shares, withdraw tokens |
-| `swap(trader, token_in, amount_in, min_out) → amount_out` | Exchange tokens |
+| `flash_loan(receiver, token, amount, data) → fee` | Borrow pool reserves and repay within the receiver callback |
+| `add_liquidity(provider, amount_a, amount_b, min_shares, deadline) → shares` | Deposit tokens, receive LP shares |
+| `remove_liquidity(provider, shares, min_a, min_b, deadline) → (a, b)` | Burn LP shares, withdraw tokens |
+| `swap(trader, token_in, amount_in, min_out, deadline) → amount_out` | Exchange tokens |
+| `swap_exact_out(trader, token_out, amount_out, max_in, deadline) → amount_in` | Buy an exact amount of output token |
 | `get_amount_out(token_in, amount_in) → amount_out` | Quote a swap without executing it |
+| `get_amount_in(token_out, amount_out) → amount_in` | Quote the input required for an exact output |
+| `simulate_swap(token_in, amount_in) → SwapSimulation` | Detailed quote including fee breakdown and price impact |
 | `get_info() → PoolInfo` | Read pool state — reserves, fees, total shares, admin, fee recipient, protocol fee |
 | `get_accrued_fees() → (i128, i128)` | Read pending protocol fees in `(token_a, token_b)` without moving funds |
+| `get_protocol_fee() → (Option<Address>, i128)` | Read the protocol fee recipient and rate |
+| `set_protocol_fee(admin, recipient, protocol_fee_bps)` | Configure protocol fee collection |
+| `withdraw_protocol_fees() → (i128, i128)` | Transfer accrued protocol fees to the recipient |
 | `shares_of(provider) → shares` | Read an LP's share balance |
+| `price_ratio() → (i128, i128)` | Read the spot price ratio for both directions |
+| `get_price_cumulative() → (i128, i128, u64)` | Read cumulative price accumulators for TWAP computation |
+| `update_fee(new_fee_bps)` | Update the swap fee (no-admin variant; emits event) |
 | `propose_admin(current_admin, new_admin)` | Nominate a new admin; emits `admin_nominated` |
 | `accept_admin(new_admin)` | Nominee accepts the role; emits `admin_changed` |
+| `upgrade(new_wasm_hash)` | Upgrade the contract code; requires admin auth |
 
 ### Factory Contract
 
@@ -171,7 +226,10 @@ A single-entry-point contract for creating and discovering AMM pools. The factor
 | `initialize(admin, amm_wasm_hash, token_wasm_hash)` | One-time factory setup |
 | `create_pool(token_a, token_b, fee_bps) → Address` | Deploy a new AMM + LP token pair; panics on duplicate |
 | `get_pool(token_a, token_b) → Option<Address>` | Look up an existing pool (order-independent) |
+| `get_lp_token(pool) → Option<Address>` | Look up the LP token for a given pool address |
 | `all_pools() → Vec<Address>` | List every pool deployed by this factory |
+| `update_wasm_hashes(amm_wasm_hash, token_wasm_hash)` | Update the WASM hashes used for future pool deployments |
+| `upgrade(new_wasm_hash)` | Upgrade the factory contract code; requires admin auth |
 
 #### Notes
 
@@ -181,22 +239,88 @@ A single-entry-point contract for creating and discovering AMM pools. The factor
 
 ---
 
+### Governance Contract
+
+Located in [contracts/governance/src/lib.rs](contracts/governance/src/lib.rs).
+
+Allows LP token holders to propose and vote on parameter changes to a pool on-chain. Proposals are time-locked and require a quorum of voting power to pass.
+
+#### Public Interface
+
+| Function | Description |
+|---|---|
+| `initialize(amm, lp_token, voting_period, quorum_bps, min_proposer_stake_bps)` | One-time governance setup |
+| `set_min_proposer_stake_bps(new_bps)` | Update the minimum LP stake required to create a proposal |
+| `propose(proposer, new_fee_bps) → u32` | Create a proposal to change the pool fee; returns proposal ID |
+| `vote(voter, proposal_id, support)` | Cast a for/against vote weighted by the voter's LP balance |
+| `execute(proposal_id)` | Execute a passing proposal after the voting period ends |
+| `cancel_proposal(proposal_id, proposer)` | Cancel a pending proposal before voting ends |
+| `unlock_vote(voter, proposal_id)` | Release vote-locked LP tokens after a proposal is resolved |
+| `get_proposal(proposal_id) → Proposal` | Read proposal details |
+| `proposal_status(proposal_id) → ProposalStatus` | Read the current status of a proposal |
+| `get_vote_info(proposal_id, voter) → VoteRecord` | Read a specific voter's record on a proposal |
+| `get_params() → GovernanceParams` | Read current governance configuration |
+
+#### Notes
+
+- Voting power is snapshotted at the time `vote` is called, based on current LP token balance.
+- LP tokens used to vote are locked until `unlock_vote` is called after the proposal resolves.
+- A proposal passes if `for_votes / total_supply ≥ quorum_bps / 10_000` and `for_votes > against_votes`.
+- Only the original proposer can cancel a proposal, and only before the voting period ends.
+
+---
+
 ### TWAP Consumer Contract
 
 Located in [contracts/twap_consumer/src/lib.rs](contracts/twap_consumer/src/lib.rs).
 
-An example integration contract that reads the AMM cumulative oracle and computes a windowed TWAP for token A.
+An integration contract that reads the AMM's cumulative price oracle and computes a fixed-window TWAP. Lending protocols, derivatives, and any contract needing an on-chain price feed can use this as a reference or deploy it directly.
 
 | Function | Description |
 |---|---|
 | `save_snapshot(pool)` | Stores `(cum_a, cum_b, pool_ts)` under `Snapshot(pool, pool_ts)` |
-| `get_twap_price(pool, window_seconds) -> i128` | Returns `(cum_a_now - cum_a_then) / window_seconds`, where `cum_a_then` comes from the snapshot at `now_ts - window_seconds` |
-
-This contract is intentionally simple and intended as integration documentation for downstream builders.
+| `get_twap_price(pool, window_seconds) → i128` | Returns `(cum_a_now - cum_a_then) / window_seconds`, where `cum_a_then` comes from the snapshot at `now_ts - window_seconds` |
 
 ---
 
-### LP Token Contract
+### Concentrated Liquidity Contract
+
+Located in [contracts/concentrated_liquidity/src/lib.rs](contracts/concentrated_liquidity/src/lib.rs).
+
+A V3-style tick-based AMM where liquidity providers specify a price range `[lower_tick, upper_tick]` for their capital. Only liquidity within the active price range earns fees, which allows far greater capital efficiency than a full-range V2 pool.
+
+**Status: in active development.** The position model and fee accounting are implemented. The tick registry, tick bitmap, sqrtPriceX96 math library, and swap engine are tracked in issues [#177](https://github.com/promisszn/soroban-amm/issues/177)–[#180](https://github.com/promisszn/soroban-amm/issues/180).
+
+#### How it differs from V2
+
+| | V2 AMM | Concentrated Liquidity |
+|---|---|---|
+| Price model | Full range `x*y=k` | Tick-bounded range positions |
+| LP representation | Fungible LP tokens | Per-user tick-range positions |
+| Capital efficiency | Liquidity spread over all prices | Capital concentrated in active range |
+| Fee accrual | All LPs share fees equally | Only in-range LPs earn fees |
+| TWAP | Price ratio accumulator | Tick accumulator (`tick * Δt`) |
+
+#### Public Interface
+
+| Function | Description |
+|---|---|
+| `initialize(token_a, token_b, fee_bps, initial_tick)` | One-time pool setup |
+| `mint_position(provider, lower_tick, upper_tick, amount_a_desired, amount_b_desired, min_a, min_b) → (a, b)` | Open or add to a tick-range position |
+| `burn_position(provider, lower_tick, upper_tick, liquidity) → (a, b)` | Reduce or close a position and withdraw tokens |
+| `collect_fees(provider, lower_tick, upper_tick) → (a, b)` | Collect accrued fees for a position |
+| `get_position(provider, lower_tick, upper_tick) → Position` | Read a position's current state |
+| `current_tick() → i32` | Read the active tick |
+| `active_liquidity() → i128` | Read total liquidity at the current price |
+
+#### Notes
+
+- Positions are identified by `(owner, lower_tick, upper_tick)` — not by a fungible token. Each address can hold multiple non-overlapping or overlapping positions.
+- Depositing a single token is the natural behavior: if the current price is above the position range, only token B is needed; if below, only token A.
+- Tick spacing: ticks range from `−887_272` to `887_272`, corresponding to the price range `[~1.0001^−887272, ~1.0001^887272]`.
+
+---
+
 #### Flash Loan Receiver Interface
 
 Borrowers must implement a callback contract with this interface:
@@ -229,7 +353,7 @@ Located in [contracts/token/src/lib.rs](contracts/token/src/lib.rs).
 
 ## Math & Formulas
 
-### Constant-Product Invariant
+### Constant-Product Invariant (V2)
 
 Every swap must satisfy:
 
@@ -276,6 +400,16 @@ out_a = shares * reserve_a / total_shares
 out_b = shares * reserve_b / total_shares
 ```
 
+### Concentrated Liquidity Price Model
+
+Price is represented as `sqrtPrice` — the square root of the token B / token A ratio. Ticks are integer indices where each tick step is a `0.01%` price change:
+
+```
+price(tick) = 1.0001^tick
+```
+
+Token amounts for a position `[lower_tick, upper_tick]` with liquidity `L` are derived from the sqrt price at each boundary, following the Uniswap v3 whitepaper formulas.
+
 ---
 
 ## Getting Started
@@ -283,9 +417,9 @@ out_b = shares * reserve_b / total_shares
 ### Prerequisites
 
 - [Rust](https://www.rust-lang.org/tools/install) (stable toolchain)
-- `wasm32-unknown-unknown` compilation target:
+- `wasm32v1-none` compilation target:
   ```sh
-  rustup target add wasm32-unknown-unknown
+  rustup target add wasm32v1-none
   ```
 - [Stellar CLI](https://developers.stellar.org/docs/tools/stellar-cli) (`stellar`) for deployment:
   ```sh
@@ -297,7 +431,7 @@ out_b = shares * reserve_b / total_shares
 1. **Clone the repository:**
 
    ```sh
-   git clone https://github.com/your-org/soroban-amm.git
+   git clone https://github.com/promisszn/soroban-amm.git
    cd soroban-amm
    ```
 
@@ -305,13 +439,13 @@ out_b = shares * reserve_b / total_shares
 
    ```sh
    rustup show                          # confirm stable toolchain is active
-   rustup target list --installed       # should include wasm32-unknown-unknown
+   rustup target list --installed       # should include wasm32v1-none
    ```
 
    If the WASM target is missing:
 
    ```sh
-   rustup target add wasm32-unknown-unknown
+   rustup target add wasm32v1-none
    ```
 
 3. **Configure the Stellar CLI for your target network** (testnet shown):
@@ -350,42 +484,38 @@ You are now ready to build, test, and deploy.
 Build all contracts as optimised WASM binaries:
 
 ```sh
-cargo wasm
+cargo build --release --target wasm32v1-none
 ```
 
-`wasm` is a Cargo alias defined in [.cargo/config.toml](.cargo/config.toml) that expands to:
+Or via the Makefile alias:
 
 ```sh
-cargo build --release --target wasm32-unknown-unknown
+make build
 ```
 
 Output files:
 
 ```
-target/wasm32-unknown-unknown/release/amm.wasm
-target/wasm32-unknown-unknown/release/token.wasm
+target/wasm32v1-none/release/amm.wasm
+target/wasm32v1-none/release/token.wasm
+target/wasm32v1-none/release/factory.wasm
+target/wasm32v1-none/release/governance.wasm
+target/wasm32v1-none/release/twap_consumer.wasm
+target/wasm32v1-none/release/concentrated_liquidity.wasm
 ```
 
 ### Test
 
-The AMM and token contract tests run without pre-built WASM:
+Run the full test suite across all packages:
 
 ```sh
-cargo test -p amm -p token
+cargo build --release --target wasm32v1-none
+cargo test --workspace
 ```
 
-The factory tests embed compiled WASM at compile time, so build WASM first:
+The factory tests embed compiled WASM at compile time, so the build step is required before running tests. All other packages can be tested independently without a prior build.
 
-```sh
-cargo build --release --target wasm32-unknown-unknown
-cargo test -p factory
-```
-
-Or run the full suite in one go:
-
-```sh
-cargo build --release --target wasm32-unknown-unknown && cargo test
-```
+The same command runs in CI on every pull request.
 
 For a real-network smoke test on Stellar testnet, run the end-to-end script:
 
@@ -433,13 +563,21 @@ A machine-readable JSON schema of all public contract functions, parameters, and
 | `proposed` | `("proposed")` | `(proposal_id, proposer, new_fee_bps, vote_end)` |
 | `voted` | `("voted")` | `(proposal_id, voter, support, voting_power)` |
 | `executed` | `("executed")` | `(proposal_id, new_fee_bps)` |
+| `cancelled` | `("cancelled")` | `(proposal_id, proposer)` |
+
+#### Concentrated Liquidity Event Payloads
+
+| Event | Topics | Data Payload |
+|---|---|---|
+| `mint_pos` | `("mint_pos", provider)` | `(lower_tick, upper_tick, liquidity, amount_a, amount_b)` |
+| `burn_pos` | `("burn_pos", provider)` | `(lower_tick, upper_tick, liquidity, amount_a, amount_b)` |
 
 ### Development
 
 The project includes a `Makefile` to simplify common development tasks:
 
-- `make build`: Build contracts for production (`wasm32-unknown-unknown`)
-- `make test`: Run all contract unit tests
+- `make build`: Build contracts for production (`wasm32v1-none`)
+- `make test`: Build WASM then run all contract unit tests
 - `make fmt`: Format code using `cargo fmt`
 - `make lint`: Run `clippy` with warnings treated as errors
 - `make check`: Run formatting, linting, and tests in sequence
@@ -471,12 +609,12 @@ The factory is the recommended way to create pools. It deploys and initialises t
 
 ```sh
 stellar contract upload \
-  --wasm target/wasm32-unknown-unknown/release/amm.wasm \
+  --wasm target/wasm32v1-none/release/amm.wasm \
   --network testnet --source <YOUR_KEY>
 # → prints AMM_WASM_HASH
 
 stellar contract upload \
-  --wasm target/wasm32-unknown-unknown/release/token.wasm \
+  --wasm target/wasm32v1-none/release/token.wasm \
   --network testnet --source <YOUR_KEY>
 # → prints TOKEN_WASM_HASH
 ```
@@ -485,7 +623,7 @@ stellar contract upload \
 
 ```sh
 stellar contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/factory.wasm \
+  --wasm target/wasm32v1-none/release/factory.wasm \
   --network testnet --source <YOUR_KEY>
 # → prints FACTORY_CONTRACT_ID
 ```
@@ -536,13 +674,13 @@ Deploy the LP token contract first, then the AMM pool. The AMM contract address 
 ```sh
 # Deploy the LP token
 stellar contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/token.wasm \
+  --wasm target/wasm32v1-none/release/token.wasm \
   --network testnet \
   --source <YOUR_KEY>
 
 # Deploy the AMM pool
 stellar contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/amm.wasm \
+  --wasm target/wasm32v1-none/release/amm.wasm \
   --network testnet \
   --source <YOUR_KEY>
 ```
@@ -588,10 +726,11 @@ stellar contract invoke \
   --provider <PROVIDER_ADDRESS> \
   --amount_a 1000000 \
   --amount_b 2000000 \
-  --min_shares 0
+  --min_shares 0 \
+  --deadline <UNIX_TIMESTAMP>
 ```
 
-`min_shares` is the minimum LP tokens you are willing to accept. Set to `0` to skip slippage protection during initial seeding.
+`min_shares` is the minimum LP tokens you are willing to accept. Set to `0` to skip slippage protection during initial seeding. `deadline` is the latest ledger timestamp at which the call is valid.
 
 ### Swap Tokens
 
@@ -604,7 +743,8 @@ stellar contract invoke \
   --trader <TRADER_ADDRESS> \
   --token_in <TOKEN_A_CONTRACT_ID> \
   --amount_in 100000 \
-  --min_out 0
+  --min_out 0 \
+  --deadline <UNIX_TIMESTAMP>
 ```
 
 Use `get_amount_out` first to compute an appropriate `min_out`.
@@ -620,7 +760,8 @@ stellar contract invoke \
   --provider <PROVIDER_ADDRESS> \
   --shares <LP_SHARE_AMOUNT> \
   --min_a 0 \
-  --min_b 0
+  --min_b 0 \
+  --deadline <UNIX_TIMESTAMP>
 ```
 
 ### Query the Pool
@@ -669,7 +810,7 @@ stellar contract invoke \
 Notes:
 
 - `window_seconds` must be greater than 0.
-- `save_snapshot` must have been called exactly at `now_ts - window_seconds` (matching the pool timestamp used by `get_price_cumulative`).
+- `save_snapshot` must have been called at approximately `now_ts - window_seconds`.
 - Returned TWAP is scaled the same way as AMM spot price (`1_000_000` scale factor).
 
 ### TypeScript Client Example
@@ -728,8 +869,8 @@ Contributions are welcome. Please follow the guidelines below to keep the codeba
 2. **Make your changes**, then ensure the build and tests pass:
 
    ```sh
-   cargo build --release --target wasm32-unknown-unknown
-   cargo test
+   cargo build --release --target wasm32v1-none
+   cargo test --workspace
    ```
 
 3. **Write tests** for any new behavior. All public functions should have at least one test. Tests live alongside the implementation in `src/lib.rs` under a `#[cfg(test)]` module.
@@ -768,7 +909,7 @@ Before requesting review, confirm:
 
 - [ ] `cargo fmt` has been run
 - [ ] `cargo clippy -- -D warnings` passes
-- [ ] `cargo test` passes
+- [ ] `cargo test --workspace` passes
 - [ ] New behavior is covered by tests
 - [ ] Public interface changes are reflected in this README
 - [ ] `CHANGELOG.md` has been updated with any notable changes
