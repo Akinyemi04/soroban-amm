@@ -2986,6 +2986,19 @@ mod prop_tests {
     }
 
     #[test]
+    fn test_get_fee_info() {
+        let (env, admin, amm_addr, lp_addr, _) = setup();
+        let (ta_client, _) = create_sac(&env, &admin);
+        let (tb_client, _) = create_sac(&env, &admin);
+
+        let amm = AmmPoolClient::new(&env, &amm_addr);
+        amm.initialize(&ta_client.address, &tb_client.address, &lp_addr, &30_i128);
+
+        assert_eq!(amm.get_fee_info(), 30_i128);
+        assert_eq!(amm.get_fee_info(), amm.get_info().fee_bps);
+    }
+
+    #[test]
     #[should_panic]
     fn test_pause_requires_admin_auth() {
         let env = Env::default();
