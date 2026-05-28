@@ -10,13 +10,28 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec,
+    contract, contractclient, contractimpl, contracterror, contracttype, Address, BytesN, Env,
+    Symbol, Vec,
 };
+
+// ── Typed errors ─────────────────────────────────────────────────────────────
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum FactoryError {
+    AlreadyInitialized  = 1,
+    InvalidFeeBps       = 2,
+    PoolAlreadyExists   = 3,
+    ClPoolAlreadyExists = 4,
+    ClWasmNotSet        = 5,
+    Unauthorized        = 6,
+}
 
 #[contractclient(name = "ClPoolClient")]
 pub trait ClPoolInterface {
     fn initialize(
         env: Env,
+        admin: Address,
         token_a: Address,
         token_b: Address,
         fee_bps: i128,
@@ -100,9 +115,9 @@ impl Factory {
         admin: Address,
         amm_wasm_hash: BytesN<32>,
         token_wasm_hash: BytesN<32>,
-    ) {
+    ) -> Result<(), FactoryError> {
         if env.storage().instance().has(&DataKey::Admin) {
-            panic!("already initialized");
+            return Err(FactoryError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
@@ -115,6 +130,7 @@ impl Factory {
             .instance()
             .set(&DataKey::AllPools, &Vec::<Address>::new(&env));
         env.storage().instance().set(&DataKey::PoolCount, &0u64);
+        Ok(())
     }
 
     // ── Pool creation ─────────────────────────────────────────────────────────
@@ -135,7 +151,7 @@ impl Factory {
         token_b: Address,
         fee_bps: i128,
         governance_wasm_hash: Option<BytesN<32>>,
-    ) -> (Address, Option<Address>) {
+    ) -> Result<(Address, Option<Address>), FactoryError> {
         // Normalise: smaller address is always token_a.
         let (ta, tb) = if token_a < token_b {
             (token_a, token_b)
@@ -143,17 +159,16 @@ impl Factory {
             (token_b, token_a)
         };
 
-        assert!(
-            (0..=10_000).contains(&fee_bps),
-            "invalid fee_bps: {fee_bps} must be in 0..=10_000"
-        );
+        if !(0..=10_000).contains(&fee_bps) {
+            return Err(FactoryError::InvalidFeeBps);
+        }
 
         if env
             .storage()
             .instance()
             .has(&DataKey::Pool(ta.clone(), tb.clone()))
         {
-            panic!("pool already exists");
+            return Err(FactoryError::PoolAlreadyExists);
         }
 
         let amm_wasm: BytesN<32> = env.storage().instance().get(&DataKey::AmmWasmHash).unwrap();
@@ -260,7 +275,7 @@ impl Factory {
             ),
         );
 
-        (pool_addr, gov_addr)
+        Ok((pool_addr, gov_addr))
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────────
@@ -276,7 +291,7 @@ impl Factory {
         env: Env,
         amm_wasm_hash: Option<BytesN<32>>,
         token_wasm_hash: Option<BytesN<32>>,
-    ) {
+    ) -> Result<(), FactoryError> {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         if let Some(ref h) = amm_wasm_hash {
@@ -289,26 +304,29 @@ impl Factory {
             (Symbol::new(&env, "wasm_updated"),),
             (amm_wasm_hash, token_wasm_hash),
         );
+        Ok(())
     }
 
     /// Replace the factory contract WASM with a new version. Admin-only.
     ///
     /// The new WASM must already be uploaded to the network.
     /// State is preserved; only bytecode is replaced.
-    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), FactoryError> {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.deployer()
             .update_current_contract_wasm(new_wasm_hash.clone());
         env.events()
             .publish((Symbol::new(&env, "upgraded"),), (new_wasm_hash,));
+        Ok(())
     }
 
     /// Set or update the WASM hash used for concentrated_liquidity deployments. Admin-only.
-    pub fn set_cl_wasm_hash(env: Env, cl_wasm_hash: BytesN<32>) {
+    pub fn set_cl_wasm_hash(env: Env, cl_wasm_hash: BytesN<32>) -> Result<(), FactoryError> {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage().instance().set(&DataKey::ClWasmHash, &cl_wasm_hash);
+        Ok(())
     }
 
     /// Deploy a new concentrated liquidity pool for `(token_a, token_b)` at `fee_bps`.
@@ -325,11 +343,10 @@ impl Factory {
         token_b: Address,
         fee_bps: i128,
         initial_tick: i32,
-    ) -> Address {
-        assert!(
-            (0..=10_000).contains(&fee_bps),
-            "invalid fee_bps: must be in 0..=10_000"
-        );
+    ) -> Result<Address, FactoryError> {
+        if !(0..=10_000).contains(&fee_bps) {
+            return Err(FactoryError::InvalidFeeBps);
+        }
 
         // Normalise token order.
         let (ta, tb) = if token_a < token_b {
@@ -340,14 +357,14 @@ impl Factory {
 
         let cl_key = DataKey::ClPool(ta.clone(), tb.clone(), fee_bps);
         if env.storage().instance().has(&cl_key) {
-            panic!("cl pool already exists for this (token_a, token_b, fee_bps)");
+            return Err(FactoryError::ClPoolAlreadyExists);
         }
 
         let cl_wasm: BytesN<32> = env
             .storage()
             .instance()
             .get(&DataKey::ClWasmHash)
-            .expect("cl_wasm_hash not set; call set_cl_wasm_hash first");
+            .ok_or(FactoryError::ClWasmNotSet)?;
 
         let n: u64 = env
             .storage()
@@ -363,7 +380,8 @@ impl Factory {
             .with_current_contract(cl_salt)
             .deploy(cl_wasm);
 
-        ClPoolClient::new(&env, &pool_addr).initialize(&ta, &tb, &fee_bps, &initial_tick);
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        ClPoolClient::new(&env, &pool_addr).initialize(&admin, &ta, &tb, &fee_bps, &initial_tick);
 
         env.storage().instance().set(&cl_key, &pool_addr);
 
@@ -372,7 +390,7 @@ impl Factory {
             (ta.clone(), tb.clone(), fee_bps, pool_addr.clone()),
         );
 
-        pool_addr
+        Ok(pool_addr)
     }
 
     // ── Queries ───────────────────────────────────────────────────────────────
