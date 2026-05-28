@@ -13,6 +13,17 @@ use soroban_sdk::{
     contract, contractclient, contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec,
 };
 
+#[contractclient(name = "ClPoolClient")]
+pub trait ClPoolInterface {
+    fn initialize(
+        env: Env,
+        token_a: Address,
+        token_b: Address,
+        fee_bps: i128,
+        initial_tick: i32,
+    );
+}
+
 #[contractclient(name = "AmmPoolClient")]
 pub trait AmmPoolInterface {
     #[allow(clippy::too_many_arguments)]
@@ -59,14 +70,16 @@ pub trait GovernanceInterface {
 
 #[contracttype]
 pub enum DataKey {
-    Pool(Address, Address), // normalized (token_a, token_b) → pool Address
-    LpToken(Address),       // pool address → LP token address
-    AllPools,               // Vec<Address> of every deployed pool
+    Pool(Address, Address),          // normalized (token_a, token_b) → pool Address
+    LpToken(Address),                // pool address → LP token address
+    AllPools,                        // Vec<Address> of every deployed pool
     Admin,
     AmmWasmHash,
     TokenWasmHash,
-    PoolCount,              // u64 monotonic counter — used to derive unique deploy salts
-    GovernanceFor(Address), // pool address → Option<Address>
+    ClWasmHash,                      // WASM hash for concentrated_liquidity deployments
+    PoolCount,                       // u64 monotonic counter — used to derive unique deploy salts
+    GovernanceFor(Address),          // pool address → Option<Address>
+    ClPool(Address, Address, i128),  // normalized (token_a, token_b, fee_bps) → CL pool Address
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -291,6 +304,77 @@ impl Factory {
             .publish((Symbol::new(&env, "upgraded"),), (new_wasm_hash,));
     }
 
+    /// Set or update the WASM hash used for concentrated_liquidity deployments. Admin-only.
+    pub fn set_cl_wasm_hash(env: Env, cl_wasm_hash: BytesN<32>) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::ClWasmHash, &cl_wasm_hash);
+    }
+
+    /// Deploy a new concentrated liquidity pool for `(token_a, token_b)` at `fee_bps`.
+    ///
+    /// A given (token_a, token_b, fee_bps) triplet is unique — the same pair can have
+    /// multiple CL pools at different fee tiers. Token order is normalised (smaller
+    /// address first). Panics if the triplet already has a pool.
+    ///
+    /// Unlike V2 pools, no LP token is deployed — positions are tracked on-chain by
+    /// the CL contract itself.
+    pub fn create_cl_pool(
+        env: Env,
+        token_a: Address,
+        token_b: Address,
+        fee_bps: i128,
+        initial_tick: i32,
+    ) -> Address {
+        assert!(
+            (0..=10_000).contains(&fee_bps),
+            "invalid fee_bps: must be in 0..=10_000"
+        );
+
+        // Normalise token order.
+        let (ta, tb) = if token_a < token_b {
+            (token_a, token_b)
+        } else {
+            (token_b, token_a)
+        };
+
+        let cl_key = DataKey::ClPool(ta.clone(), tb.clone(), fee_bps);
+        if env.storage().instance().has(&cl_key) {
+            panic!("cl pool already exists for this (token_a, token_b, fee_bps)");
+        }
+
+        let cl_wasm: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ClWasmHash)
+            .expect("cl_wasm_hash not set; call set_cl_wasm_hash first");
+
+        let n: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolCount)
+            .unwrap_or(0);
+        // CL pools use n * 3 + 2 so they don't collide with V2 pool/LP/gov salts.
+        let cl_salt = Self::make_salt(&env, n * 3 + 2 + 0x8000_0000_0000_0000);
+        env.storage().instance().set(&DataKey::PoolCount, &(n + 1));
+
+        let pool_addr = env
+            .deployer()
+            .with_current_contract(cl_salt)
+            .deploy(cl_wasm);
+
+        ClPoolClient::new(&env, &pool_addr).initialize(&ta, &tb, &fee_bps, &initial_tick);
+
+        env.storage().instance().set(&cl_key, &pool_addr);
+
+        env.events().publish(
+            (Symbol::new(&env, "cl_pool_created"),),
+            (ta.clone(), tb.clone(), fee_bps, pool_addr.clone()),
+        );
+
+        pool_addr
+    }
+
     // ── Queries ───────────────────────────────────────────────────────────────
 
     /// Return the LP token address for the given pool, or `None` if unknown.
@@ -315,6 +399,17 @@ impl Factory {
             (token_b, token_a)
         };
         env.storage().instance().get(&DataKey::Pool(ta, tb))
+    }
+
+    /// Return the CL pool address for `(token_a, token_b, fee_bps)`, or `None` if absent.
+    /// Token pair order does not matter.
+    pub fn get_cl_pool(env: Env, token_a: Address, token_b: Address, fee_bps: i128) -> Option<Address> {
+        let (ta, tb) = if token_a < token_b {
+            (token_a, token_b)
+        } else {
+            (token_b, token_a)
+        };
+        env.storage().instance().get(&DataKey::ClPool(ta, tb, fee_bps))
     }
 
     /// Return the addresses of every pool deployed by this factory.
@@ -628,6 +723,69 @@ mod tests {
 
         // Partial update — only amm_wasm_hash.
         factory.update_wasm_hashes(&Some(amm_hash.clone()), &None);
+    }
+
+    // ── Issue #182: CL pool creation ──────────────────────────────────────────
+
+    #[test]
+    fn test_create_cl_pool_two_fee_tiers() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+        let cl_hash = env.deployer().upload_contract_wasm(concentrated_liquidity::WASM);
+
+        let admin = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+        factory.set_cl_wasm_hash(&cl_hash);
+
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+
+        // Deploy same pair at two different fee tiers.
+        let pool_30 = factory.create_cl_pool(&ta, &tb, &30_i128, &0_i32);
+        let pool_100 = factory.create_cl_pool(&ta, &tb, &100_i128, &0_i32);
+
+        // Both pools are distinct addresses.
+        assert_ne!(pool_30, pool_100);
+
+        // get_cl_pool returns the correct address for each tier.
+        assert_eq!(factory.get_cl_pool(&ta, &tb, &30_i128), Some(pool_30.clone()));
+        assert_eq!(factory.get_cl_pool(&ta, &tb, &100_i128), Some(pool_100.clone()));
+
+        // Token order doesn't matter for lookup.
+        assert_eq!(factory.get_cl_pool(&tb, &ta, &30_i128), Some(pool_30));
+
+        // Missing tier returns None.
+        assert_eq!(factory.get_cl_pool(&ta, &tb, &500_i128), None);
+    }
+
+    #[test]
+    fn test_create_cl_pool_duplicate_panics() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+        let cl_hash = env.deployer().upload_contract_wasm(concentrated_liquidity::WASM);
+
+        let admin = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+        factory.set_cl_wasm_hash(&cl_hash);
+
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+
+        factory.create_cl_pool(&ta, &tb, &30_i128, &0_i32);
+        let result = factory.try_create_cl_pool(&ta, &tb, &30_i128, &0_i32);
+        assert!(result.is_err());
     }
 
     #[test]

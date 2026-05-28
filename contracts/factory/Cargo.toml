@@ -8,7 +8,7 @@ crate-type = ["cdylib", "rlib"]
 
 
 [features]
-testutils = ["soroban-sdk/testutils", "amm/testutils", "token/testutils"]
+testutils = ["soroban-sdk/testutils", "amm/testutils", "token/testutils", "concentrated_liquidity/testutils"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
@@ -18,4 +18,5 @@ soroban-sdk = { workspace = true, features = ["testutils"] }
 amm = { path = "../amm", features = ["testutils"] }
 token = { path = "../token", features = ["testutils"] }
 governance = { path = "../governance", features = ["testutils"] }
+concentrated_liquidity = { path = "../concentrated_liquidity", features = ["testutils"] }
 

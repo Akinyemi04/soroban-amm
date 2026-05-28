@@ -7,6 +7,11 @@ pub trait AmmPoolOracle {
     fn get_price_cumulative(env: Env) -> (i128, i128, u64);
 }
 
+#[contractclient(name = "ClPoolOracleClient")]
+pub trait ClPoolOracle {
+    fn get_tick_cumulative(env: Env) -> (i64, u64);
+}
+
 #[contracttype]
 pub enum DataKey {
     Snapshot(Address, u64),
@@ -117,6 +122,52 @@ impl TwapConsumer {
         let twap_b_to_a = delta_b / elapsed;
 
         (twap_a_to_b, twap_b_to_a)
+    }
+
+    /// Computes the time-weighted average tick from a CL pool over `window_seconds`.
+    ///
+    /// Uses `get_tick_cumulative` from the CL pool. Returns the average tick value,
+    /// which maps to a price via 1.0001^avg_tick. A snapshot at `now - window_seconds`
+    /// must have been saved previously via `save_snapshot`.
+    pub fn get_cl_twap(env: Env, pool: Address, window_seconds: u64) -> i64 {
+        assert!(window_seconds > 0, "window_seconds must be > 0");
+
+        let (cum_now, last_ts_now) = ClPoolOracleClient::new(&env, &pool).get_tick_cumulative();
+        let ledger_ts_now = env.ledger().timestamp();
+        assert!(
+            ledger_ts_now >= window_seconds,
+            "ledger timestamp is smaller than requested window"
+        );
+
+        let then_ts = ledger_ts_now - window_seconds;
+        let snapshot: PriceSnapshot = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Snapshot(pool.clone(), then_ts))
+            .unwrap_or_else(|| panic!("missing snapshot at target ledger timestamp {then_ts}"));
+
+        // snapshot.cum_a stores the tick_cumulative cast to i128 for CL pools.
+        let cum_then = snapshot.cum_a as i64;
+        let elapsed_pool = (last_ts_now - snapshot.pool_ts) as i64;
+        assert!(elapsed_pool > 0, "window too small (pool time did not advance)");
+
+        ((cum_now - cum_then) / elapsed_pool) as i64
+    }
+
+    /// Save a snapshot from a CL pool (stores tick_cumulative in the cum_a field).
+    pub fn save_cl_snapshot(env: Env, pool: Address) {
+        let (tick_cum, pool_ts) = ClPoolOracleClient::new(&env, &pool).get_tick_cumulative();
+        let ledger_ts = env.ledger().timestamp();
+        let snapshot = PriceSnapshot {
+            cum_a: tick_cum as i128,
+            cum_b: 0,
+            pool_ts,
+        };
+        let key = DataKey::Snapshot(pool, ledger_ts);
+        env.storage().persistent().set(&key, &snapshot);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, Self::SNAPSHOT_TTL_LEDGERS / 2, Self::SNAPSHOT_TTL_LEDGERS);
     }
 }
 
