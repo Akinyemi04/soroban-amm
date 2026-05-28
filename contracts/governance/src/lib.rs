@@ -19,13 +19,45 @@ pub const WASM: &[u8] = include_bytes!(concat!(
     "/../../target/wasm32v1-none/release/governance.wasm"
 ));
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracterror, contracttype, Address, Env, Symbol};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const MAX_BPS: i128 = 10_000;
 const MIN_PERSISTENT_TTL: u32 = 172_800; // ~10 days at 5s/ledger
 const PERSISTENT_TTL_BUMP_TO: u32 = 259_200; // ~15 days at 5s/ledger
+
+// ── Typed errors ─────────────────────────────────────────────────────────────
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum GovernanceError {
+    AlreadyInitialized      = 1,
+    InvalidVotingPeriod     = 2,
+    InvalidTimelock         = 3,
+    InvalidQuorumBps        = 4,
+    InvalidProposerStake    = 5,
+    InvalidFeeBps           = 6,
+    ZeroTotalSupply         = 7,
+    InsufficientStake       = 8,
+    ProposalNotFound        = 9,
+    VotingNotStarted        = 10,
+    VotingPeriodEnded       = 11,
+    AlreadyExecuted         = 12,
+    ProposalCancelled       = 13,
+    AlreadyVoted            = 14,
+    NoVotingPower           = 15,
+    VotingPeriodActive      = 16,
+    ProposalExpired         = 17,
+    TimelockNotElapsed      = 18,
+    QuorumNotMet            = 19,
+    ProposalDefeated        = 20,
+    NotProposer             = 21,
+    NoLockedVote            = 22,
+    ProposalNotConcluded    = 23,
+    CannotDelegateToSelf    = 24,
+    Unauthorized            = 25,
+}
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
 
@@ -195,21 +227,22 @@ impl Governance {
         timelock_secs: u64,
         quorum_bps: i128,
         min_proposer_stake_bps: i128,
-    ) {
-        assert!(
-            !env.storage().instance().has(&DataKey::AmmPool),
-            "already initialized"
-        );
-        assert!(voting_period_secs > 0, "voting_period_secs must be > 0");
-        assert!(timelock_secs > 0, "timelock_secs must be > 0");
-        assert!(
-            (1..=MAX_BPS).contains(&quorum_bps),
-            "quorum_bps must be in [1, 10_000]"
-        );
-        assert!(
-            (0..=MAX_BPS).contains(&min_proposer_stake_bps),
-            "invalid min proposer stake bps"
-        );
+    ) -> Result<(), GovernanceError> {
+        if env.storage().instance().has(&DataKey::AmmPool) {
+            return Err(GovernanceError::AlreadyInitialized);
+        }
+        if voting_period_secs == 0 {
+            return Err(GovernanceError::InvalidVotingPeriod);
+        }
+        if timelock_secs == 0 {
+            return Err(GovernanceError::InvalidTimelock);
+        }
+        if !(1..=MAX_BPS).contains(&quorum_bps) {
+            return Err(GovernanceError::InvalidQuorumBps);
+        }
+        if !(0..=MAX_BPS).contains(&min_proposer_stake_bps) {
+            return Err(GovernanceError::InvalidProposerStake);
+        }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::AmmPool, &amm_pool);
         env.storage().instance().set(&DataKey::LpToken, &lp_token);
@@ -226,19 +259,29 @@ impl Governance {
             .instance()
             .set(&DataKey::MinProposerStakeBps, &min_proposer_stake_bps);
         env.storage().instance().set(&DataKey::ProposalCount, &0u32);
+        Ok(())
     }
 
     /// Admin-only governance parameter update.
-    pub fn set_min_proposer_stake_bps(env: Env, new_bps: i128) {
+    pub fn set_min_proposer_stake_bps(env: Env, new_bps: i128) -> Result<(), GovernanceError> {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
-        assert!(
-            (0..=MAX_BPS).contains(&new_bps),
-            "invalid min proposer stake bps"
-        );
+        if !(0..=MAX_BPS).contains(&new_bps) {
+            return Err(GovernanceError::InvalidProposerStake);
+        }
         env.storage()
             .instance()
             .set(&DataKey::MinProposerStakeBps, &new_bps);
+        Ok(())
+    }
+
+    /// Admin-only: update the timelock delay between vote end and execution.
+    /// A delay of 0 means execution is allowed immediately after the voting period ends.
+    pub fn set_timelock_delay(env: Env, new_delay: u64) -> Result<(), GovernanceError> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Timelock, &new_delay);
+        Ok(())
     }
 
     // ── Core functions ────────────────────────────────────────────────────────
@@ -247,24 +290,24 @@ impl Governance {
     ///
     /// The proposer must hold at least the configured minimum LP stake.
     /// Returns the new `proposal_id`.
-    pub fn propose(env: Env, proposer: Address, kind: ProposalKind) -> u32 {
+    pub fn propose(env: Env, proposer: Address, kind: ProposalKind) -> Result<u32, GovernanceError> {
         proposer.require_auth();
 
         match &kind {
             ProposalKind::UpdateFee(new_fee_bps) => {
-                assert!((0..=MAX_BPS).contains(new_fee_bps), "invalid fee");
+                if !(0..=MAX_BPS).contains(new_fee_bps) {
+                    return Err(GovernanceError::InvalidFeeBps);
+                }
             }
             ProposalKind::UpdateProtocolFee(params) => {
-                assert!(
-                    (0..=MAX_BPS).contains(&params.new_bps),
-                    "invalid protocol fee bps"
-                );
+                if !(0..=MAX_BPS).contains(&params.new_bps) {
+                    return Err(GovernanceError::InvalidFeeBps);
+                }
             }
             ProposalKind::UpdateFlashLoanFee(new_bps) => {
-                assert!(
-                    (0..=MAX_BPS).contains(new_bps),
-                    "invalid flash loan fee bps"
-                );
+                if !(0..=MAX_BPS).contains(new_bps) {
+                    return Err(GovernanceError::InvalidFeeBps);
+                }
             }
             ProposalKind::TransferAdmin(_new_admin) => {}
             ProposalKind::PausePool => {}
@@ -275,7 +318,9 @@ impl Governance {
         let lp_client = LpTokenClient::new(&env, &lp_token);
 
         let total_supply = lp_client.total_supply();
-        assert!(total_supply > 0, "LP total supply is zero");
+        if total_supply == 0 {
+            return Err(GovernanceError::ZeroTotalSupply);
+        }
         let proposer_balance = lp_client.balance(&proposer);
         let min_bps: i128 = env
             .storage()
@@ -283,10 +328,9 @@ impl Governance {
             .get(&DataKey::MinProposerStakeBps)
             .unwrap_or(0);
         let min_stake = ((total_supply * min_bps) / MAX_BPS).max(1);
-        assert!(
-            proposer_balance >= min_stake,
-            "insufficient stake to propose"
-        );
+        if proposer_balance < min_stake {
+            return Err(GovernanceError::InsufficientStake);
+        }
 
         let voting_period: u64 = env
             .storage()
@@ -298,7 +342,8 @@ impl Governance {
         let now = env.ledger().timestamp();
         let vote_end = now + voting_period;
         let execute_after = vote_end + timelock;
-        let expires_at = execute_after + timelock; // extra window to execute
+        // Execution window: at least one voting period even when timelock is 0.
+        let expires_at = execute_after + timelock.max(voting_period);
 
         let id: u32 = env
             .storage()
@@ -334,14 +379,14 @@ impl Governance {
             (id, proposer, kind, vote_end),
         );
 
-        id
+        Ok(id)
     }
 
     /// Cast a vote on an active proposal.
     ///
     /// Voting power = voter's current LP balance, which is then locked until
     /// the proposal concludes. Each address may only vote once per proposal.
-    pub fn vote(env: Env, voter: Address, proposal_id: u32, choice: Vote) {
+    pub fn vote(env: Env, voter: Address, proposal_id: u32, choice: Vote) -> Result<(), GovernanceError> {
         voter.require_auth();
 
         let proposal_key = DataKey::Proposal(proposal_id);
@@ -349,22 +394,34 @@ impl Governance {
             .storage()
             .persistent()
             .get(&proposal_key)
-            .expect("proposal not found");
+            .ok_or(GovernanceError::ProposalNotFound)?;
         Self::bump_key_ttl(&env, &proposal_key);
 
         let now = env.ledger().timestamp();
-        assert!(now >= proposal.vote_start, "voting not started");
-        assert!(now <= proposal.vote_end, "voting period has ended");
-        assert!(!proposal.executed, "proposal already executed");
-        assert!(!proposal.cancelled, "proposal is cancelled");
+        if now < proposal.vote_start {
+            return Err(GovernanceError::VotingNotStarted);
+        }
+        if now > proposal.vote_end {
+            return Err(GovernanceError::VotingPeriodEnded);
+        }
+        if proposal.executed {
+            return Err(GovernanceError::AlreadyExecuted);
+        }
+        if proposal.cancelled {
+            return Err(GovernanceError::ProposalCancelled);
+        }
 
         let voted_key = DataKey::HasVoted(proposal_id, voter.clone());
-        assert!(!env.storage().persistent().has(&voted_key), "already voted");
+        if env.storage().persistent().has(&voted_key) {
+            return Err(GovernanceError::AlreadyVoted);
+        }
 
         let lp_token: Address = env.storage().instance().get(&DataKey::LpToken).unwrap();
         let lp_client = LpTokenClient::new(&env, &lp_token);
         let voting_power = lp_client.balance(&voter);
-        assert!(voting_power > 0, "no LP tokens: voting power is zero");
+        if voting_power == 0 {
+            return Err(GovernanceError::NoVotingPower);
+        }
         lp_client.lock(&voter, &voting_power);
 
         match choice {
@@ -398,43 +455,50 @@ impl Governance {
             (Symbol::new(&env, "voted"),),
             (proposal_id, voter, choice, voting_power),
         );
+        Ok(())
     }
 
     /// Execute a passed proposal after the timelock has elapsed.
     ///
     /// Anyone can call this once the conditions are met.
-    pub fn execute(env: Env, proposal_id: u32) {
+    pub fn execute(env: Env, proposal_id: u32) -> Result<(), GovernanceError> {
         let proposal_key = DataKey::Proposal(proposal_id);
         let mut proposal: Proposal = env
             .storage()
             .persistent()
             .get(&proposal_key)
-            .expect("proposal not found");
+            .ok_or(GovernanceError::ProposalNotFound)?;
         Self::bump_key_ttl(&env, &proposal_key);
 
-        assert!(!proposal.executed, "already executed");
-        assert!(!proposal.cancelled, "proposal is cancelled");
+        if proposal.executed {
+            return Err(GovernanceError::AlreadyExecuted);
+        }
+        if proposal.cancelled {
+            return Err(GovernanceError::ProposalCancelled);
+        }
 
         let now = env.ledger().timestamp();
 
-        assert!(now > proposal.vote_end, "voting period not ended");
-        assert!(now <= proposal.expires_at, "proposal expired");
-        assert!(now >= proposal.execute_after, "timelock not elapsed");
+        if now <= proposal.vote_end {
+            return Err(GovernanceError::VotingPeriodActive);
+        }
+        if now > proposal.expires_at {
+            return Err(GovernanceError::ProposalExpired);
+        }
+        if now < proposal.execute_after {
+            return Err(GovernanceError::TimelockNotElapsed);
+        }
 
         let quorum_bps: i128 = env.storage().instance().get(&DataKey::QuorumBps).unwrap();
         let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
         let quorum_threshold = proposal.snapshot_total_supply * quorum_bps / MAX_BPS;
-        assert!(
-            total_votes >= quorum_threshold,
-            "quorum not met: votes={total_votes}, required={quorum_threshold}"
-        );
+        if total_votes < quorum_threshold {
+            return Err(GovernanceError::QuorumNotMet);
+        }
 
-        assert!(
-            proposal.votes_for > proposal.votes_against,
-            "proposal defeated: for={}, against={}",
-            proposal.votes_for,
-            proposal.votes_against
-        );
+        if proposal.votes_for <= proposal.votes_against {
+            return Err(GovernanceError::ProposalDefeated);
+        }
 
         let amm_pool: Address = env.storage().instance().get(&DataKey::AmmPool).unwrap();
         let amm_client = AmmPoolClient::new(&env, &amm_pool);
@@ -469,11 +533,12 @@ impl Governance {
             (Symbol::new(&env, "executed"),),
             (proposal_id, proposal.kind.clone()),
         );
+        Ok(())
     }
 
     /// Cancel an active proposal. Only the original proposer can cancel,
     /// and only while voting is still open.
-    pub fn cancel_proposal(env: Env, proposal_id: u32, proposer: Address) {
+    pub fn cancel_proposal(env: Env, proposal_id: u32, proposer: Address) -> Result<(), GovernanceError> {
         proposer.require_auth();
 
         let proposal_key = DataKey::Proposal(proposal_id);
@@ -481,16 +546,21 @@ impl Governance {
             .storage()
             .persistent()
             .get(&proposal_key)
-            .expect("proposal not found");
+            .ok_or(GovernanceError::ProposalNotFound)?;
         Self::bump_key_ttl(&env, &proposal_key);
 
-        assert!(!proposal.executed, "cannot cancel executed proposal");
-        assert!(!proposal.cancelled, "already cancelled");
-        assert!(
-            env.ledger().timestamp() <= proposal.vote_end,
-            "voting period ended"
-        );
-        assert!(proposal.proposer == proposer, "not the proposer");
+        if proposal.executed {
+            return Err(GovernanceError::AlreadyExecuted);
+        }
+        if proposal.cancelled {
+            return Err(GovernanceError::ProposalCancelled);
+        }
+        if env.ledger().timestamp() > proposal.vote_end {
+            return Err(GovernanceError::VotingPeriodEnded);
+        }
+        if proposal.proposer != proposer {
+            return Err(GovernanceError::NotProposer);
+        }
 
         proposal.cancelled = true;
         env.storage().persistent().set(&proposal_key, &proposal);
@@ -498,6 +568,7 @@ impl Governance {
 
         env.events()
             .publish((Symbol::new(&env, "cancelled"),), (proposal_id,));
+        Ok(())
     }
 
     /// Query how an address voted on a proposal.
@@ -529,23 +600,31 @@ impl Governance {
     }
 
     /// Unlock voting power for a concluded proposal.
-    pub fn unlock_vote(env: Env, voter: Address, proposal_id: u32) {
+    pub fn unlock_vote(env: Env, voter: Address, proposal_id: u32) -> Result<(), GovernanceError> {
         voter.require_auth();
         let status = Self::proposal_status(env.clone(), proposal_id);
-        assert!(
-            status == ProposalStatus::Executed
-                || status == ProposalStatus::Defeated
-                || status == ProposalStatus::Expired
-                || status == ProposalStatus::Cancelled,
-            "proposal not concluded"
-        );
+        if status != ProposalStatus::Executed
+            && status != ProposalStatus::Defeated
+            && status != ProposalStatus::Expired
+            && status != ProposalStatus::Cancelled
+        {
+            return Err(GovernanceError::ProposalNotConcluded);
+        }
         let lock_key = DataKey::LockedVote(proposal_id, voter.clone());
         let locked: i128 = env.storage().persistent().get(&lock_key).unwrap_or(0);
-        assert!(locked > 0, "no locked vote");
+        if locked == 0 {
+            return Err(GovernanceError::NoLockedVote);
+        }
 
         let lp_token: Address = env.storage().instance().get(&DataKey::LpToken).unwrap();
         LpTokenClient::new(&env, &lp_token).unlock(&voter, &locked);
         env.storage().persistent().remove(&lock_key);
+
+        env.events().publish(
+            (Symbol::new(&env, "vote_unlocked"), voter.clone()),
+            (proposal_id, locked),
+        );
+        Ok(())
     }
 
     /// Delegate voting power to another address.
@@ -559,9 +638,11 @@ impl Governance {
     ///
     /// # Panics
     /// - If `from` is the same as `to`.
-    pub fn delegate(env: Env, from: Address, to: Address) {
+    pub fn delegate(env: Env, from: Address, to: Address) -> Result<(), GovernanceError> {
         from.require_auth();
-        assert!(from != to, "cannot delegate to self");
+        if from == to {
+            return Err(GovernanceError::CannotDelegateToSelf);
+        }
 
         env.storage()
             .instance()
@@ -569,6 +650,7 @@ impl Governance {
 
         env.events()
             .publish((Symbol::new(&env, "delegated"),), (from, to));
+        Ok(())
     }
 
     /// Remove delegation of voting power.
@@ -1190,6 +1272,121 @@ mod tests {
         let result = gov.try_execute(&pid);
         assert!(result.is_err());
     }
+
+    // ── Issue #188: set_timelock_delay ────────────────────────────────────────
+
+    #[test]
+    fn test_timelock_delay_zero_allows_immediate_execution() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+        let lp1 = Address::generate(&s.env);
+        let lp2 = Address::generate(&s.env);
+        mint_lp(&s, &lp1, 600);
+        mint_lp(&s, &lp2, 400);
+
+        // Set timelock delay to 0 so execution is allowed immediately after vote_end.
+        gov.set_timelock_delay(&0_u64);
+        let params = gov.get_params();
+        assert_eq!(params.timelock_secs, 0);
+
+        let pid = gov.propose(&lp1, &ProposalKind::UpdateFee(50));
+        gov.vote(&lp1, &pid, &Vote::For);
+        gov.vote(&lp2, &pid, &Vote::For);
+
+        let proposal = gov.get_proposal(&pid);
+        // With timelock = 0: execute_after = vote_end, expires_at = vote_end + voting_period.
+        // Jump to execute_after + 1 to satisfy now >= execute_after.
+        s.env.ledger().set_timestamp(proposal.execute_after + 1);
+
+        gov.execute(&pid);
+        assert_eq!(gov.proposal_status(&pid), ProposalStatus::Executed);
+    }
+
+    #[test]
+    fn test_execute_reverts_before_timelock_elapses() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+        let lp1 = Address::generate(&s.env);
+        let lp2 = Address::generate(&s.env);
+        mint_lp(&s, &lp1, 600);
+        mint_lp(&s, &lp2, 400);
+
+        let pid = gov.propose(&lp1, &ProposalKind::UpdateFee(50));
+        gov.vote(&lp1, &pid, &Vote::For);
+        gov.vote(&lp2, &pid, &Vote::For);
+
+        let proposal = gov.get_proposal(&pid);
+        // Jump past vote_end but NOT past execute_after.
+        s.env.ledger().set_timestamp(proposal.vote_end + 1);
+
+        let result = gov.try_execute(&pid);
+        assert_eq!(result, Err(Ok(GovernanceError::TimelockNotElapsed)));
+    }
+
+    #[test]
+    fn test_execute_succeeds_after_timelock_elapses() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+        let lp1 = Address::generate(&s.env);
+        let lp2 = Address::generate(&s.env);
+        mint_lp(&s, &lp1, 600);
+        mint_lp(&s, &lp2, 400);
+
+        let pid = gov.propose(&lp1, &ProposalKind::UpdateFee(50));
+        gov.vote(&lp1, &pid, &Vote::For);
+        gov.vote(&lp2, &pid, &Vote::For);
+
+        let proposal = gov.get_proposal(&pid);
+        // Jump past execute_after.
+        s.env.ledger().set_timestamp(proposal.execute_after + 1);
+
+        gov.execute(&pid);
+        assert_eq!(gov.proposal_status(&pid), ProposalStatus::Executed);
+    }
+
+    // ── Issue #189: vote_unlocked event ──────────────────────────────────────
+
+    #[test]
+    fn test_unlock_vote_emits_vote_unlocked_event() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::IntoVal;
+
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+        let lp1 = Address::generate(&s.env);
+        let lp2 = Address::generate(&s.env);
+        mint_lp(&s, &lp1, 600);
+        mint_lp(&s, &lp2, 400);
+
+        let pid = gov.propose(&lp1, &ProposalKind::UpdateFee(50));
+        gov.vote(&lp1, &pid, &Vote::For);
+        gov.vote(&lp2, &pid, &Vote::For);
+
+        let proposal = gov.get_proposal(&pid);
+        s.env.ledger().set_timestamp(proposal.execute_after + 1);
+        gov.execute(&pid);
+
+        gov.unlock_vote(&lp1, &pid);
+
+        let events = s.env.events().all();
+        let unlock_evt = events
+            .iter()
+            .find(|e| {
+                e.0 == s.gov_addr
+                    && e.1
+                        == (Symbol::new(&s.env, "vote_unlocked"), lp1.clone())
+                            .into_val(&s.env)
+            })
+            .expect("vote_unlocked event not emitted");
+
+        let data: (u32, i128) = unlock_evt.2.into_val(&s.env);
+        assert_eq!(data.0, pid);
+        assert_eq!(data.1, 600_i128); // amount_unlocked == voting power used
+    }
 }
 
 // ── Property-based tests ───────────────────────────────────────────────────────
@@ -1253,16 +1450,16 @@ mod prop_tests {
             prop_assert!(min_stake <= total_supply.max(1));
         }
 
-        /// Property 6: Expiry logic boundaries always remain correct.
+        /// Property 6: Expiry always comes at or after execute_after.
         #[test]
         fn expiry_logic_boundaries(
             vote_end in 0u64..u64::MAX / 3,
             timelock in 0u64..u64::MAX / 3,
+            voting_period in 1u64..u64::MAX / 3,
         ) {
             let execute_after = vote_end + timelock;
-            let expires_at = execute_after + timelock;
+            let expires_at = execute_after + timelock.max(voting_period);
             prop_assert!(expires_at >= execute_after);
-            prop_assert_eq!(expires_at, vote_end + 2 * timelock);
         }
     }
 }

@@ -10,8 +10,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN,
-    Env, Symbol,
+    contract, contractclient, contractimpl, contracterror, contracttype, symbol_short, Address,
+    Bytes, BytesN, Env, Symbol,
 };
 // Export compiled WASM for tests/dev usage when the `testutils` feature is enabled.
 #[cfg(feature = "testutils")]
@@ -38,6 +38,26 @@ pub trait LpTokenInterface {
     fn mint(env: Env, to: Address, amount: i128);
     fn burn(env: Env, from: Address, amount: i128);
     fn balance(env: Env, id: Address) -> i128;
+}
+
+// ── Typed errors ─────────────────────────────────────────────────────────────
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum AmmError {
+    AlreadyInitialized   = 1,
+    InvalidFeeBps        = 2,
+    InsufficientShares   = 3,
+    DeadlineExceeded     = 4,
+    SlippageExceeded     = 5,
+    Paused               = 6,
+    Unauthorized         = 7,
+    ZeroAmount           = 8,
+    InvalidToken         = 9,
+    EmptyPool            = 10,
+    InsufficientLiquidity = 11,
+    NoPendingAdmin       = 12,
+    WrongAdmin           = 13,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -138,7 +158,7 @@ impl AmmPool {
         fee_bps: i128, // recommended: 30 (0.30 %)
         fee_recipient: Address,
         protocol_fee_bps: i128,
-    ) {
+    ) -> Result<(), AmmError> {
         Self::initialize_with_flash_loan_fee(
             env,
             admin,
@@ -149,7 +169,7 @@ impl AmmPool {
             fee_recipient,
             protocol_fee_bps,
             fee_bps,
-        );
+        )
     }
 
     /// Initialize the pool with a distinct flash-loan fee.
@@ -164,23 +184,18 @@ impl AmmPool {
         fee_recipient: Address,
         protocol_fee_bps: i128,
         flash_loan_fee_bps: i128,
-    ) {
+    ) -> Result<(), AmmError> {
         if env.storage().instance().has(&DataKey::TokenA) {
-            panic!(
-                "already initialized: contract {:?}",
-                env.current_contract_address()
-            );
+            return Err(AmmError::AlreadyInitialized);
         }
-        assert!(
-            token_a != token_b,
-            "tokens must differ: token_a={token_a:?}, token_b={token_b:?}"
-        );
-        Self::validate_fee_bps(fee_bps);
-        Self::validate_fee_bps(flash_loan_fee_bps);
-        assert!(
-            (0..=fee_bps).contains(&protocol_fee_bps),
-            "invalid protocol fee: {protocol_fee_bps} must be in 0..={fee_bps}"
-        );
+        if token_a == token_b {
+            return Err(AmmError::InvalidToken);
+        }
+        Self::validate_fee_bps(fee_bps)?;
+        Self::validate_fee_bps(flash_loan_fee_bps)?;
+        if !(0..=fee_bps).contains(&protocol_fee_bps) {
+            return Err(AmmError::InvalidFeeBps);
+        }
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::TokenA, &token_a);
@@ -211,18 +226,21 @@ impl AmmPool {
             .instance()
             .set(&DataKey::LastTimestamp, &env.ledger().timestamp());
         env.storage().instance().set(&DataKey::Paused, &false);
+        Ok(())
     }
 
-    pub fn pause(env: Env) {
+    pub fn pause(env: Env) -> Result<(), AmmError> {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
+        Ok(())
     }
 
-    pub fn unpause(env: Env) {
+    pub fn unpause(env: Env) -> Result<(), AmmError> {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
+        Ok(())
     }
 
     pub fn is_paused(env: Env) -> bool {
@@ -236,21 +254,23 @@ impl AmmPool {
     ///
     /// Set `protocol_fee_bps` to 0 to disable protocol fee collection.
     /// `protocol_fee_bps` must be ≤ the pool's `fee_bps`.
-    pub fn set_protocol_fee(env: Env, admin: Address, recipient: Address, protocol_fee_bps: i128) {
+    pub fn set_protocol_fee(env: Env, admin: Address, recipient: Address, protocol_fee_bps: i128) -> Result<(), AmmError> {
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        assert!(admin == stored_admin, "not admin");
+        if admin != stored_admin {
+            return Err(AmmError::Unauthorized);
+        }
         admin.require_auth();
         let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
-        assert!(
-            protocol_fee_bps >= 0 && protocol_fee_bps <= fee_bps,
-            "invalid protocol fee"
-        );
+        if protocol_fee_bps < 0 || protocol_fee_bps > fee_bps {
+            return Err(AmmError::InvalidFeeBps);
+        }
         env.storage()
             .instance()
             .set(&DataKey::FeeRecipient, &recipient);
         env.storage()
             .instance()
             .set(&DataKey::ProtocolFeeBps, &protocol_fee_bps);
+        Ok(())
     }
 
     /// Return the current protocol fee recipient and rate.
@@ -268,11 +288,11 @@ impl AmmPool {
 
     /// Validate that a fee value is within the allowed range [0, 10_000].
     /// Shared by initialize, update_fee, and set_protocol_fee.
-    fn validate_fee_bps(fee_bps: i128) {
-        assert!(
-            (0..=10_000).contains(&fee_bps),
-            "invalid fee_bps: {fee_bps} is outside 0..=10_000"
-        );
+    fn validate_fee_bps(fee_bps: i128) -> Result<(), AmmError> {
+        if !(0..=10_000).contains(&fee_bps) {
+            return Err(AmmError::InvalidFeeBps);
+        }
+        Ok(())
     }
 
     /// Update the swap fee post-deployment. Admin-only.
@@ -288,29 +308,29 @@ impl AmmPool {
     /// - If `admin` auth fails.
     /// - If `new_fee_bps` is outside [0, 10_000].
     /// - If `new_fee_bps` is less than the current `protocol_fee_bps`.
-    pub fn update_fee(env: Env, new_fee_bps: i128) {
+    pub fn update_fee(env: Env, new_fee_bps: i128) -> Result<(), AmmError> {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
-        Self::validate_fee_bps(new_fee_bps);
+        Self::validate_fee_bps(new_fee_bps)?;
         let protocol_fee_bps: i128 = env
             .storage()
             .instance()
             .get(&DataKey::ProtocolFeeBps)
             .unwrap_or(0);
-        assert!(
-            new_fee_bps >= protocol_fee_bps,
-            "fee_bps must be >= protocol_fee_bps: new={new_fee_bps}, protocol={protocol_fee_bps}"
-        );
+        if new_fee_bps < protocol_fee_bps {
+            return Err(AmmError::InvalidFeeBps);
+        }
         env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
         env.events()
             .publish((symbol_short!("fee_upd"), admin.clone()), (new_fee_bps,));
+        Ok(())
     }
 
     /// Update the flash loan fee post-deployment. Admin-only.
-    pub fn update_flash_loan_fee(env: Env, new_fee_bps: i128) {
+    pub fn update_flash_loan_fee(env: Env, new_fee_bps: i128) -> Result<(), AmmError> {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
-        Self::validate_fee_bps(new_fee_bps);
+        Self::validate_fee_bps(new_fee_bps)?;
         env.storage()
             .instance()
             .set(&DataKey::FlashLoanFeeBps, &new_fee_bps);
@@ -318,6 +338,7 @@ impl AmmPool {
             (Symbol::new(&env, "flash_fee_upd"), admin.clone()),
             (new_fee_bps,),
         );
+        Ok(())
     }
 
     /// Nominate a new admin. The nominee must call `accept_admin` to complete the transfer.
@@ -325,9 +346,11 @@ impl AmmPool {
     /// # Panics
     /// - If `current_admin` is not the stored admin.
     /// - If `current_admin` auth fails.
-    pub fn propose_admin(env: Env, current_admin: Address, new_admin: Address) {
+    pub fn propose_admin(env: Env, current_admin: Address, new_admin: Address) -> Result<(), AmmError> {
         let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        assert!(current_admin == stored, "not admin");
+        if current_admin != stored {
+            return Err(AmmError::Unauthorized);
+        }
         current_admin.require_auth();
         env.storage()
             .instance()
@@ -336,22 +359,20 @@ impl AmmPool {
             (Symbol::new(&env, "admin_nominated"),),
             (current_admin, new_admin),
         );
+        Ok(())
     }
 
     /// Accept the pending admin nomination. Caller becomes the new admin.
-    ///
-    /// # Panics
-    /// - If there is no pending admin proposal.
-    /// - If `new_admin` does not match the pending nominee.
-    /// - If `new_admin` auth fails.
-    pub fn accept_admin(env: Env, new_admin: Address) {
+    pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), AmmError> {
         let pending: Option<Address> = env
             .storage()
             .instance()
             .get(&DataKey::PendingAdmin)
             .unwrap_or(None);
-        let nominee = pending.expect("no pending admin proposal");
-        assert!(new_admin == nominee, "caller is not the pending admin");
+        let nominee = pending.ok_or(AmmError::NoPendingAdmin)?;
+        if new_admin != nominee {
+            return Err(AmmError::WrongAdmin);
+        }
         new_admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.storage()
@@ -359,19 +380,21 @@ impl AmmPool {
             .set(&DataKey::PendingAdmin, &Option::<Address>::None);
         env.events()
             .publish((Symbol::new(&env, "admin_changed"),), (new_admin,));
+        Ok(())
     }
 
     /// Replace the contract WASM with a new version. Admin-only.
     ///
     /// The new WASM must already be uploaded to the network.
     /// State is preserved; only bytecode is replaced.
-    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), AmmError> {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.deployer()
             .update_current_contract_wasm(new_wasm_hash.clone());
         env.events()
             .publish((Symbol::new(&env, "upgraded"),), (new_wasm_hash,));
+        Ok(())
     }
 
     /// Return the pending admin nominee, or `None` if no transfer is in progress.
@@ -457,14 +480,17 @@ impl AmmPool {
         amount_b: i128,
         min_shares: i128,
         deadline: u64,
-    ) -> i128 {
-        assert!(deadline >= env.ledger().timestamp(), "deadline exceeded");
-        assert!(!Self::is_paused(env.clone()), "pool is paused");
+    ) -> Result<i128, AmmError> {
+        if deadline < env.ledger().timestamp() {
+            return Err(AmmError::DeadlineExceeded);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(AmmError::Paused);
+        }
         provider.require_auth();
-        assert!(
-            amount_a > 0 && amount_b > 0,
-            "amounts must be positive: amount_a={amount_a}, amount_b={amount_b}"
-        );
+        if amount_a <= 0 || amount_b <= 0 {
+            return Err(AmmError::ZeroAmount);
+        }
 
         // Checkpoint TWAP before updating reserves.
         Self::checkpoint_twap(&env);
@@ -488,14 +514,12 @@ impl AmmPool {
             shares_a.min(shares_b)
         };
 
-        assert!(
-            shares > 0,
-            "amounts too small: computed shares would be zero"
-        );
-        assert!(
-            shares >= min_shares,
-            "slippage: insufficient shares minted: computed={shares}, minimum={min_shares}"
-        );
+        if shares <= 0 {
+            return Err(AmmError::ZeroAmount);
+        }
+        if shares < min_shares {
+            return Err(AmmError::SlippageExceeded);
+        }
 
         // Pull tokens from provider into the pool contract.
         let client_a = SepTokenClient::new(&env, &token_a);
@@ -523,7 +547,7 @@ impl AmmPool {
             (amount_a, amount_b, shares),
         );
 
-        shares
+        Ok(shares)
     }
 
     /// Withdraw liquidity from the pool by burning LP shares.
@@ -559,20 +583,25 @@ impl AmmPool {
         min_a: i128,
         min_b: i128,
         deadline: u64,
-    ) -> (i128, i128) {
-        assert!(deadline >= env.ledger().timestamp(), "deadline exceeded");
-        assert!(!Self::is_paused(env.clone()), "pool is paused");
+    ) -> Result<(i128, i128), AmmError> {
+        if deadline < env.ledger().timestamp() {
+            return Err(AmmError::DeadlineExceeded);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(AmmError::Paused);
+        }
         provider.require_auth();
-        assert!(shares > 0, "shares must be positive: got {shares}");
+        if shares <= 0 {
+            return Err(AmmError::ZeroAmount);
+        }
 
         // Checkpoint TWAP before updating reserves.
         Self::checkpoint_twap(&env);
 
         let owned = Self::shares_of(env.clone(), provider.clone());
-        assert!(
-            owned >= shares,
-            "insufficient LP shares: owned={owned}, requested={shares}"
-        );
+        if owned < shares {
+            return Err(AmmError::InsufficientShares);
+        }
 
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
@@ -585,14 +614,9 @@ impl AmmPool {
         let out_a = shares * reserve_a / total_shares;
         let out_b = shares * reserve_b / total_shares;
 
-        assert!(
-            out_a >= min_a,
-            "slippage: insufficient token_a out: got={out_a}, min={min_a}"
-        );
-        assert!(
-            out_b >= min_b,
-            "slippage: insufficient token_b out: got={out_b}, min={min_b}"
-        );
+        if out_a < min_a || out_b < min_b {
+            return Err(AmmError::SlippageExceeded);
+        }
 
         // Burn LP tokens.
         let lp_client = LpTokenClient::new(&env, &lp_token);
@@ -620,7 +644,7 @@ impl AmmPool {
             (provider.clone(), shares, out_a, out_b),
         );
 
-        (out_a, out_b)
+        Ok((out_a, out_b))
     }
 
     /// Burn LP shares and return a single token, swapping the other internally.
@@ -657,29 +681,33 @@ impl AmmPool {
         token_out: Address,
         min_out: i128,
         deadline: u64,
-    ) -> i128 {
-        assert!(deadline >= env.ledger().timestamp(), "deadline exceeded");
-        assert!(!Self::is_paused(env.clone()), "pool is paused");
+    ) -> Result<i128, AmmError> {
+        if deadline < env.ledger().timestamp() {
+            return Err(AmmError::DeadlineExceeded);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(AmmError::Paused);
+        }
         provider.require_auth();
-        assert!(shares > 0, "shares must be positive: got {shares}");
+        if shares <= 0 {
+            return Err(AmmError::ZeroAmount);
+        }
 
         // Checkpoint TWAP before updating reserves.
         Self::checkpoint_twap(&env);
 
         let owned = Self::shares_of(env.clone(), provider.clone());
-        assert!(
-            owned >= shares,
-            "insufficient LP shares: owned={owned}, requested={shares}"
-        );
+        if owned < shares {
+            return Err(AmmError::InsufficientShares);
+        }
 
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
         let lp_token: Address = env.storage().instance().get(&DataKey::LpToken).unwrap();
 
-        assert!(
-            token_out == token_a || token_out == token_b,
-            "token_out is not part of this pool: {token_out:?}"
-        );
+        if token_out != token_a && token_out != token_b {
+            return Err(AmmError::InvalidToken);
+        }
 
         let reserve_a = Self::get_reserve_a(env.clone());
         let reserve_b = Self::get_reserve_b(env.clone());
@@ -744,10 +772,9 @@ impl AmmPool {
         // Total output is the amount we kept from withdrawal plus the swap output.
         let total_out = amount_keep + swap_output;
 
-        assert!(
-            total_out >= min_out,
-            "slippage: insufficient output amount: got={total_out}, min={min_out}"
-        );
+        if total_out < min_out {
+            return Err(AmmError::SlippageExceeded);
+        }
 
         // Update reserves after internal swap.
         let protocol_fee_bps: i128 = env
@@ -822,7 +849,7 @@ impl AmmPool {
             (provider.clone(), shares, token_out.clone(), total_out),
         );
 
-        total_out
+        Ok(total_out)
     }
 
     // ── Swap ──────────────────────────────────────────────────────────────────
@@ -863,11 +890,17 @@ impl AmmPool {
         min_out: i128,
         deadline: u64,
         referrer: Option<Address>,
-    ) -> i128 {
-        assert!(deadline >= env.ledger().timestamp(), "deadline exceeded");
-        assert!(!Self::is_paused(env.clone()), "pool is paused");
+    ) -> Result<i128, AmmError> {
+        if deadline < env.ledger().timestamp() {
+            return Err(AmmError::DeadlineExceeded);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(AmmError::Paused);
+        }
         trader.require_auth();
-        assert!(amount_in > 0, "amount_in must be positive: got {amount_in}");
+        if amount_in <= 0 {
+            return Err(AmmError::ZeroAmount);
+        }
 
         // Checkpoint TWAP before updating reserves.
         Self::checkpoint_twap(&env);
@@ -888,13 +921,12 @@ impl AmmPool {
                 token_a.clone(),
             )
         } else {
-            panic!("token_in is not part of this pool: {token_in:?}");
+            return Err(AmmError::InvalidToken);
         };
 
-        assert!(
-            reserve_in > 0 && reserve_out > 0,
-            "pool is empty: reserve_in={reserve_in}, reserve_out={reserve_out}"
-        );
+        if reserve_in <= 0 || reserve_out <= 0 {
+            return Err(AmmError::EmptyPool);
+        }
 
         let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
 
@@ -904,14 +936,12 @@ impl AmmPool {
         let amount_out =
             amount_in_with_fee * reserve_out / (reserve_in * 10_000 + amount_in_with_fee);
 
-        assert!(
-            amount_out >= min_out,
-            "slippage: insufficient output amount: got={amount_out}, min={min_out}"
-        );
-        assert!(
-            amount_out < reserve_out,
-            "insufficient liquidity: amount_out={amount_out} >= reserve_out={reserve_out}"
-        );
+        if amount_out < min_out {
+            return Err(AmmError::SlippageExceeded);
+        }
+        if amount_out >= reserve_out {
+            return Err(AmmError::InsufficientLiquidity);
+        }
 
         // Transfer in.
         let client_in = SepTokenClient::new(&env, &token_in);
@@ -974,7 +1004,7 @@ impl AmmPool {
             (token_in, amount_in, token_out, amount_out, referrer),
         );
 
-        amount_out
+        Ok(amount_out)
     }
 
     /// Swap a variable input amount to receive exactly `amount_out` of `token_out`.
@@ -1006,11 +1036,17 @@ impl AmmPool {
         max_in: i128,
         deadline: u64,
         referrer: Option<Address>,
-    ) -> i128 {
-        assert!(deadline >= env.ledger().timestamp(), "deadline exceeded");
-        assert!(!Self::is_paused(env.clone()), "pool is paused");
+    ) -> Result<i128, AmmError> {
+        if deadline < env.ledger().timestamp() {
+            return Err(AmmError::DeadlineExceeded);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(AmmError::Paused);
+        }
         trader.require_auth();
-        assert!(amount_out > 0, "amount_out must be positive");
+        if amount_out <= 0 {
+            return Err(AmmError::ZeroAmount);
+        }
 
         // Checkpoint TWAP before updating reserves.
         Self::checkpoint_twap(&env);
@@ -1023,14 +1059,13 @@ impl AmmPool {
         } else if token_out == token_b {
             token_a.clone()
         } else {
-            panic!("token_out is not part of this pool: {token_out:?}");
+            return Err(AmmError::InvalidToken);
         };
 
         let amount_in = Self::get_amount_in(env.clone(), token_out.clone(), amount_out);
-        assert!(
-            amount_in <= max_in,
-            "slippage: required_in={amount_in} exceeds max_in={max_in}"
-        );
+        if amount_in > max_in {
+            return Err(AmmError::SlippageExceeded);
+        }
 
         // Transfer tokens.
         SepTokenClient::new(&env, &token_in).transfer(
@@ -1100,7 +1135,7 @@ impl AmmPool {
             (token_in, amount_in, token_out, amount_out, referrer),
         );
 
-        amount_in
+        Ok(amount_in)
     }
 
     // ── Protocol Fees ─────────────────────────────────────────────────────────
@@ -1109,7 +1144,7 @@ impl AmmPool {
     ///
     /// Only callable by the fee recipient. Resets accrued balances to zero.
     /// Returns `(fee_a_withdrawn, fee_b_withdrawn)`.
-    pub fn withdraw_protocol_fees(env: Env) -> (i128, i128) {
+    pub fn withdraw_protocol_fees(env: Env) -> Result<(i128, i128), AmmError> {
         let fee_recipient: Address = env
             .storage()
             .instance()
@@ -1149,7 +1184,7 @@ impl AmmPool {
             env.storage().instance().set(&DataKey::AccruedFeeB, &0_i128);
         }
 
-        (fee_a, fee_b)
+        Ok((fee_a, fee_b))
     }
 
     /// Borrow pool liquidity and repay it plus a fee during the receiver callback.
@@ -1159,9 +1194,13 @@ impl AmmPool {
         token: Address,
         amount: i128,
         data: Bytes,
-    ) -> i128 {
-        assert!(!Self::is_paused(env.clone()), "pool is paused");
-        assert!(amount > 0, "amount must be positive");
+    ) -> Result<i128, AmmError> {
+        if Self::is_paused(env.clone()) {
+            return Err(AmmError::Paused);
+        }
+        if amount <= 0 {
+            return Err(AmmError::ZeroAmount);
+        }
 
         // Checkpoint TWAP before updating reserves.
         Self::checkpoint_twap(&env);
@@ -1173,9 +1212,11 @@ impl AmmPool {
         } else if token == token_b {
             Self::get_reserve_b(env.clone())
         } else {
-            panic!("token is not part of this pool");
+            return Err(AmmError::InvalidToken);
         };
-        assert!(reserve >= amount, "insufficient liquidity");
+        if reserve < amount {
+            return Err(AmmError::InsufficientLiquidity);
+        }
 
         let fee_bps = Self::get_flash_loan_fee_bps(env.clone());
         let fee = if fee_bps > 0 {
@@ -1191,13 +1232,14 @@ impl AmmPool {
 
         let accepted = FlashLoanReceiverClient::new(&env, &receiver)
             .on_flash_loan(&token, &amount, &fee, &data);
-        assert!(accepted, "flash loan callback rejected");
+        if !accepted {
+            return Err(AmmError::InsufficientLiquidity);
+        }
 
         let balance_after = token_client.balance(&pool);
-        assert!(
-            balance_after >= balance_before + fee,
-            "flash loan was not repaid"
-        );
+        if balance_after < balance_before + fee {
+            return Err(AmmError::InsufficientLiquidity);
+        }
 
         let accrued_fee = if token == token_a {
             env.storage()
@@ -1226,7 +1268,7 @@ impl AmmPool {
             (token, amount, fee),
         );
 
-        fee
+        Ok(fee)
     }
 
     // ── Quotes (read-only) ────────────────────────────────────────────────────
@@ -1239,13 +1281,15 @@ impl AmmPool {
     /// - `price_b` = price of token_b in terms of token_a (reserve_a * 1_000_000 / reserve_b)
     ///
     /// Panics if either reserve is zero (pool is empty).
-    pub fn price_ratio(env: Env) -> (i128, i128) {
+    pub fn price_ratio(env: Env) -> Result<(i128, i128), AmmError> {
         let reserve_a = Self::get_reserve_a(env.clone());
         let reserve_b = Self::get_reserve_b(env);
-        assert!(reserve_a > 0 && reserve_b > 0, "pool is empty");
+        if reserve_a <= 0 || reserve_b <= 0 {
+            return Err(AmmError::EmptyPool);
+        }
         let price_a = reserve_b * 1_000_000 / reserve_a;
         let price_b = reserve_a * 1_000_000 / reserve_b;
-        (price_a, price_b)
+        Ok((price_a, price_b))
     }
 
     /// Quote how much `token_out` you receive for `amount_in` of `token_in`.
@@ -1266,7 +1310,7 @@ impl AmmPool {
     ///
     /// # Panics
     /// - If `token_in` is not one of the two pool tokens.
-    pub fn get_amount_out(env: Env, token_in: Address, amount_in: i128) -> i128 {
+    pub fn get_amount_out(env: Env, token_in: Address, amount_in: i128) -> Result<i128, AmmError> {
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
         let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
@@ -1282,15 +1326,14 @@ impl AmmPool {
                 Self::get_reserve_a(env.clone()),
             )
         } else {
-            panic!("unknown token_in: {token_in:?}");
+            return Err(AmmError::InvalidToken);
         };
 
-        assert!(
-            reserve_in > 0 && reserve_out > 0,
-            "pool is empty: reserve_in={reserve_in}, reserve_out={reserve_out}"
-        );
+        if reserve_in <= 0 || reserve_out <= 0 {
+            return Err(AmmError::EmptyPool);
+        }
         let amount_in_with_fee = amount_in * (10_000 - fee_bps);
-        amount_in_with_fee * reserve_out / (reserve_in * 10_000 + amount_in_with_fee)
+        Ok(amount_in_with_fee * reserve_out / (reserve_in * 10_000 + amount_in_with_fee))
     }
 
     /// Simulate a swap and return a detailed breakdown without executing it.
@@ -1298,8 +1341,10 @@ impl AmmPool {
     /// Returns the expected output, total fee taken, effective execution price,
     /// spot price, and price impact — all computed from current reserve state.
     /// `amount_out` is guaranteed to match `get_amount_out` for the same inputs.
-    pub fn simulate_swap(env: Env, token_in: Address, amount_in: i128) -> SwapSimulation {
-        assert!(amount_in > 0, "amount_in must be positive");
+    pub fn simulate_swap(env: Env, token_in: Address, amount_in: i128) -> Result<SwapSimulation, AmmError> {
+        if amount_in <= 0 {
+            return Err(AmmError::ZeroAmount);
+        }
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
         let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
@@ -1314,26 +1359,25 @@ impl AmmPool {
                 Self::get_reserve_a(env.clone()),
             )
         } else {
-            panic!("unknown token");
+            return Err(AmmError::InvalidToken);
         };
-        assert!(reserve_in > 0 && reserve_out > 0, "pool is empty");
+        if reserve_in <= 0 || reserve_out <= 0 {
+            return Err(AmmError::EmptyPool);
+        }
         let amount_in_with_fee = amount_in * (10_000 - fee_bps);
         let amount_out =
             amount_in_with_fee * reserve_out / (reserve_in * 10_000 + amount_in_with_fee);
         let fee_amount = amount_in * fee_bps / 10_000;
-        // Prices scaled by 1_000_000 to preserve precision in integer arithmetic.
         let spot_price = reserve_out * 1_000_000 / reserve_in;
         let effective_price = amount_out * 1_000_000 / amount_in;
-        // Price impact: how far the execution price deviates from the spot price.
-        // Clamp to [0, 10_000] to handle integer truncation edge cases on tiny amounts.
         let price_impact_bps = ((spot_price - effective_price) * 10_000 / spot_price).max(0);
-        SwapSimulation {
+        Ok(SwapSimulation {
             amount_out,
             fee_amount,
             price_impact_bps,
             effective_price,
             spot_price,
-        }
+        })
     }
 
     /// Quote how much `token_in` is required to receive exactly `amount_out` of `token_out`.
@@ -1751,8 +1795,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "pool is empty")]
-    fn test_price_ratio_panics_on_empty_pool() {
+    fn test_price_ratio_errors_on_empty_pool() {
         let (env, admin, amm_addr, lp_addr, _) = setup();
 
         let (ta_client, _) = create_sac(&env, &admin);
@@ -1769,8 +1812,9 @@ pub(crate) mod tests {
             &0_i128,
         );
 
-        // No liquidity added — reserves are zero, should panic
-        amm.price_ratio();
+        // No liquidity added — reserves are zero, should return typed error
+        let result = amm.try_price_ratio();
+        assert_eq!(result, Err(Ok(AmmError::EmptyPool)));
     }
 
     #[test]
