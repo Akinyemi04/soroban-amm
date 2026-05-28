@@ -15,6 +15,7 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
 
 #[contracttype]
 pub enum DataKey {
+    Admin,
     TokenA,
     TokenB,
     FeeBps,
@@ -46,13 +47,14 @@ impl ConcentratedLiquidityPool {
     /// the scaffold accepts them as-is from the caller.
     pub fn initialize(
         env: Env,
+        admin: Address,
         token_a: Address,
         token_b: Address,
         fee_bps: i128,
         initial_sqrt_price_x96: i128,
         initial_tick: i32,
     ) {
-        if env.storage().instance().has(&DataKey::TokenA) {
+        if env.storage().instance().has(&DataKey::Admin) {
             panic!("already initialized");
         }
         assert!(token_a != token_b, "tokens must differ");
@@ -60,6 +62,7 @@ impl ConcentratedLiquidityPool {
         assert!(initial_sqrt_price_x96 > 0, "sqrt_price must be positive");
 
         let s = env.storage().instance();
+        s.set(&DataKey::Admin, &admin);
         s.set(&DataKey::TokenA, &token_a);
         s.set(&DataKey::TokenB, &token_b);
         s.set(&DataKey::FeeBps, &fee_bps);
@@ -67,6 +70,11 @@ impl ConcentratedLiquidityPool {
         s.set(&DataKey::Tick, &initial_tick);
         s.set(&DataKey::FeeGrowthGlobalA, &0_i128);
         s.set(&DataKey::FeeGrowthGlobalB, &0_i128);
+    }
+
+    /// View: admin address set at initialization. Callable without auth.
+    pub fn get_admin(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::Admin).unwrap()
     }
 
     /// Placeholder swap: advances `sqrt_price_x96`, `tick`, and the input
@@ -142,16 +150,18 @@ mod tests {
     const INITIAL_TICK: i32 = 0;
     const FEE_BPS: i128 = 30;
 
-    fn setup() -> (Env, Address, Address, Address) {
+    fn setup() -> (Env, Address, Address, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
 
         let addr = env.register_contract(None, ConcentratedLiquidityPool);
+        let admin = Address::generate(&env);
         let token_a = Address::generate(&env);
         let token_b = Address::generate(&env);
 
         let client = ConcentratedLiquidityPoolClient::new(&env, &addr);
         client.initialize(
+            &admin,
             &token_a,
             &token_b,
             &FEE_BPS,
@@ -159,12 +169,20 @@ mod tests {
             &INITIAL_TICK,
         );
 
-        (env, addr, token_a, token_b)
+        (env, addr, admin, token_a, token_b)
+    }
+
+    #[test]
+    fn get_admin_returns_initialized_admin() {
+        let (env, addr, admin, _a, _b) = setup();
+        let client = ConcentratedLiquidityPoolClient::new(&env, &addr);
+
+        assert_eq!(client.get_admin(), admin);
     }
 
     #[test]
     fn slot0_initial_state() {
-        let (env, addr, _a, _b) = setup();
+        let (env, addr, _admin, _a, _b) = setup();
         let client = ConcentratedLiquidityPoolClient::new(&env, &addr);
 
         let slot0 = client.get_slot0();
@@ -176,7 +194,7 @@ mod tests {
 
     #[test]
     fn slot0_after_swap_token_a_in() {
-        let (env, addr, token_a, _token_b) = setup();
+        let (env, addr, _admin, token_a, _token_b) = setup();
         let client = ConcentratedLiquidityPoolClient::new(&env, &addr);
 
         let trader = Address::generate(&env);
@@ -195,7 +213,7 @@ mod tests {
 
     #[test]
     fn slot0_after_swap_token_b_in() {
-        let (env, addr, _token_a, token_b) = setup();
+        let (env, addr, _admin, _token_a, token_b) = setup();
         let client = ConcentratedLiquidityPoolClient::new(&env, &addr);
 
         let trader = Address::generate(&env);
