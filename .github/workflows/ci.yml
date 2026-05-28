@@ -52,3 +52,13 @@ jobs:
       - name: Check docs
         run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
+      - name: Security audit
+        uses: rustsec/audit-check@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+        # Advisories can be ignored via audit.toml at the repo root.
+        # Example:
+        #   [[ignore]]
+        #   id = "RUSTSEC-0000-0000"
+        #   reason = "Not exploitable in this context because ..."
+

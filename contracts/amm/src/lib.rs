@@ -3548,4 +3548,52 @@ mod prop_tests {
         let data: (Address,) = evt.2.into_val(env);
         assert_eq!(data, (nominee,));
     }
+    // Issue #193: simulate_swap price_impact_bps grows for large swaps.
+    #[test]
+    fn test_simulate_swap_price_impact_bps() {
+        let ts = setup_pool(30); // 0.30 % fee
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+
+        // Mint tokens for the provider and seed the pool with 1_000_000 of each.
+        let provider = Address::generate(env);
+        let ta_sac = soroban_sdk::token::StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = soroban_sdk::token::StellarAssetClient::new(env, &ts.tb_addr);
+        ta_sac.mint(&provider, &2_000_000_i128);
+        tb_sac.mint(&provider, &2_000_000_i128);
+
+        amm.add_liquidity(
+            &provider,
+            &1_000_000_i128,
+            &1_000_000_i128,
+            &0_i128,
+            &u64::MAX,
+        )
+        .unwrap();
+
+        // --- Tiny swap: price_impact_bps should be 0 (rounds to 0 at 1 unit). ---
+        let tiny = amm.simulate_swap(&ts.ta_addr, &1_i128).unwrap();
+        // spot and effective price differ by sub-bps amounts for 1-unit swap.
+        assert_eq!(tiny.price_impact_bps, 0);
+
+        // --- Large swap: price_impact_bps must be positive. ---
+        let large = amm.simulate_swap(&ts.ta_addr, &100_000_i128).unwrap();
+        // With reserves 1_000_000 / 1_000_000 and amount_in 100_000 (10 % of pool):
+        //   spot_price  = 1_000_000 * 1_000_000 / 1_000_000 = 1_000_000
+        //   amount_in_with_fee = 100_000 * (10000 - 30) = 997_000_000
+        //   amount_out ≈ 90_661; effective_price ≈ 906_610
+        //   price_impact_bps ≈ 934
+        assert!(large.price_impact_bps > 0, "price_impact_bps must be positive for large swap");
+
+        // Larger swap must have higher price impact than smaller swap.
+        let medium = amm.simulate_swap(&ts.ta_addr, &10_000_i128).unwrap();
+        assert!(
+            large.price_impact_bps > medium.price_impact_bps,
+            "larger swap must have larger price impact"
+        );
+        assert!(
+            medium.price_impact_bps > tiny.price_impact_bps,
+            "medium swap must have larger price impact than tiny"
+        );
+    }
 }

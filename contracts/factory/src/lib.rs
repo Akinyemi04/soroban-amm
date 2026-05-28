@@ -36,6 +36,7 @@ pub trait ClPoolInterface {
         token_b: Address,
         fee_bps: i128,
         initial_tick: i32,
+        tick_spacing: i32,
     );
 }
 
@@ -381,7 +382,14 @@ impl Factory {
             .deploy(cl_wasm);
 
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        ClPoolClient::new(&env, &pool_addr).initialize(&admin, &ta, &tb, &fee_bps, &initial_tick);
+        // Derive tick_spacing from fee tier (matching Uniswap v3 conventions).
+        let tick_spacing: i32 = match fee_bps {
+            5   => 1,
+            30  => 10,
+            100 => 60,
+            _   => 1,
+        };
+        ClPoolClient::new(&env, &pool_addr).initialize(&admin, &ta, &tb, &fee_bps, &initial_tick, &tick_spacing);
 
         env.storage().instance().set(&cl_key, &pool_addr);
 
@@ -861,5 +869,86 @@ mod tests {
         // Limit = 0.
         let page5 = factory.get_pools(&1u32, &0u32);
         assert_eq!(page5.len(), 0);
+    }
+
+    // ── Issue #194: pool_created event ───────────────────────────────────────
+
+    #[test]
+    fn test_create_pool_emits_pool_created_event() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::IntoVal;
+
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+        let admin = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+
+        let (pool_addr, _) = factory.create_pool(&ta, &tb, &30_i128, &None);
+
+        // Locate the pool_created event.
+        let events = env.events().all();
+        let expected_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+            (Symbol::new(&env, "pool_created"),).into_val(&env);
+
+        let event = events
+            .iter()
+            .find(|e| e.0 == factory_addr && e.1 == expected_topic)
+            .expect("pool_created event must be emitted on successful create_pool");
+
+        // The event data is (token_a, token_b, pool_address, fee_bps, lp_token_address).
+        // Normalised token order may differ — just assert pool and fee_bps fields.
+        let lp_addr = factory.get_lp_token(&pool_addr).unwrap();
+        let data: (Address, Address, Address, i128, Address) = event.2.into_val(&env);
+        assert_eq!(data.2, pool_addr,   "pool address in event must match");
+        assert_eq!(data.3, 30_i128,     "fee_bps in event must be 30");
+        assert_eq!(data.4, lp_addr,     "lp_token address in event must match");
+    }
+
+    #[test]
+    fn test_create_pool_duplicate_does_not_emit_event() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::IntoVal;
+
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+        let admin = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+
+        factory.create_pool(&ta, &tb, &30_i128, &None);
+
+        // Clear events so we only see events from the second (failing) call.
+        // Soroban test env accumulates events — count before the duplicate attempt.
+        let count_before = env.events().all().len();
+
+        // Duplicate call must fail.
+        let result = factory.try_create_pool(&ta, &tb, &30_i128, &None);
+        assert!(result.is_err(), "duplicate pool creation must fail");
+
+        // No new events must have been added.
+        let count_after = env.events().all().len();
+        assert_eq!(
+            count_before, count_after,
+            "no event should be emitted when create_pool reverts"
+        );
     }
 }
