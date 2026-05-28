@@ -3,6 +3,8 @@ resolver = "2"
 members = [
   "contracts/amm",
   "contracts/concentrated_liquidity",
+  "contracts/factory",
+  "contracts/router",
   "contracts/token",
   "contracts/factory",
   "contracts/twap_consumer",

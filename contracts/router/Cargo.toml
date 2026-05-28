@@ -1,0 +1,26 @@
+[package]
+name = "router"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+testutils = [
+    "soroban-sdk/testutils",
+    "amm/testutils",
+    "token/testutils",
+    "factory/testutils",
+]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+amm = { path = "../amm" }
+factory = { path = "../factory" }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+amm = { path = "../amm", features = ["testutils"] }
+token = { path = "../token", features = ["testutils"] }
+factory = { path = "../factory", features = ["testutils"] }
