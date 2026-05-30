@@ -26,6 +26,16 @@ pub struct PriceSnapshot {
     pub pool_ts: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PriceValidation {
+    pub spot_price: i128,
+    pub twap_price: i128,
+    pub deviation_bps: i128,
+    pub max_deviation_bps: i128,
+    pub is_deviation: bool,
+}
+
 #[contract]
 pub struct TwapConsumer;
 
@@ -33,6 +43,8 @@ pub struct TwapConsumer;
 impl TwapConsumer {
     /// Keep snapshot alive for 7 days (in ledgers: 7 * 24 * 3600 / 5 ≈ 120,960)
     pub const SNAPSHOT_TTL_LEDGERS: u32 = 120_960;
+    pub const BPS_DENOMINATOR: i128 = 10_000;
+    pub const PRICE_SCALE: i128 = 1_000_000;
 
     /// Stores a pool cumulative-price snapshot keyed by the pool timestamp.
     ///
@@ -108,6 +120,78 @@ impl TwapConsumer {
         assert!(elapsed > 0, "window too small (pool time did not advance)");
 
         delta_a / elapsed
+    }
+
+    /// Validates a real-time price against a TWAP price.
+    ///
+    /// Prices must use the AMM scale factor of 1_000_000. The deviation threshold
+    /// is expressed in basis points where 100 = 1%.
+    pub fn validate_price(
+        spot_price: i128,
+        twap_price: i128,
+        max_deviation_bps: i128,
+    ) -> PriceValidation {
+        assert!(spot_price > 0, "spot_price must be > 0");
+        assert!(twap_price > 0, "twap_price must be > 0");
+        assert!(
+            (0..=Self::BPS_DENOMINATOR).contains(&max_deviation_bps),
+            "max_deviation_bps must be between 0 and 10000"
+        );
+
+        let price_delta = if spot_price >= twap_price {
+            spot_price - twap_price
+        } else {
+            twap_price - spot_price
+        };
+        let deviation_bps = price_delta * Self::BPS_DENOMINATOR / twap_price;
+
+        PriceValidation {
+            spot_price,
+            twap_price,
+            deviation_bps,
+            max_deviation_bps,
+            is_deviation: deviation_bps > max_deviation_bps,
+        }
+    }
+
+    /// Computes the pool TWAP, compares it with the caller-supplied real-time
+    /// AMM spot price, and flags prices outside the configured threshold.
+    pub fn validate_price_against_twap(
+        env: Env,
+        pool: Address,
+        window_seconds: u64,
+        spot_price: i128,
+        max_deviation_bps: i128,
+    ) -> PriceValidation {
+        let twap_price = Self::get_twap_price(env, pool, window_seconds);
+        Self::validate_price(spot_price, twap_price, max_deviation_bps)
+    }
+
+    /// Lending integration helper: returns the validated collateral value when
+    /// the real-time price is within the TWAP deviation threshold and panics
+    /// when the spot price is likely manipulated.
+    pub fn assert_lending_price_safe(
+        env: Env,
+        pool: Address,
+        window_seconds: u64,
+        spot_price: i128,
+        max_deviation_bps: i128,
+        collateral_amount: i128,
+    ) -> i128 {
+        assert!(collateral_amount >= 0, "collateral_amount must be >= 0");
+        let validation = Self::validate_price_against_twap(
+            env,
+            pool,
+            window_seconds,
+            spot_price,
+            max_deviation_bps,
+        );
+        assert!(
+            !validation.is_deviation,
+            "spot price exceeds TWAP deviation threshold"
+        );
+
+        collateral_amount * validation.spot_price / Self::PRICE_SCALE
     }
 
     /// Computes TWAP for both token directions using tick accumulator approach.
@@ -200,7 +284,10 @@ impl TwapConsumer {
         // snapshot.cum_a stores the tick_cumulative cast to i128 for CL pools.
         let cum_then = snapshot.cum_a as i64;
         let elapsed_pool = (last_ts_now - snapshot.pool_ts) as i64;
-        assert!(elapsed_pool > 0, "window too small (pool time did not advance)");
+        assert!(
+            elapsed_pool > 0,
+            "window too small (pool time did not advance)"
+        );
 
         ((cum_now - cum_then) / elapsed_pool) as i64
     }
@@ -216,9 +303,11 @@ impl TwapConsumer {
         };
         let key = DataKey::Snapshot(pool, ledger_ts);
         env.storage().persistent().set(&key, &snapshot);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, Self::SNAPSHOT_TTL_LEDGERS / 2, Self::SNAPSHOT_TTL_LEDGERS);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::SNAPSHOT_TTL_LEDGERS / 2,
+            Self::SNAPSHOT_TTL_LEDGERS,
+        );
     }
 }
 
@@ -311,6 +400,153 @@ mod tests {
         assert_eq!(twap, 1_000_000);
         assert!(twap > spot_a);
         assert_ne!(twap, spot_a);
+    }
+
+    #[test]
+    fn test_validate_price_against_twap_flags_large_deviation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+
+        let admin = Address::generate(&env);
+        let amm_addr = env.register_contract(None, AmmPool);
+        let lp_addr = env.register_contract(None, LpToken);
+        let consumer_addr = env.register_contract(None, TwapConsumer);
+
+        token::LpTokenClient::new(&env, &lp_addr).initialize(
+            &amm_addr,
+            &soroban_sdk::String::from_str(&env, "AMM LP Token"),
+            &soroban_sdk::String::from_str(&env, "ALP"),
+            &7u32,
+        );
+
+        let (ta, ta_sac) = create_sac(&env, &admin);
+        let (tb, tb_sac) = create_sac(&env, &admin);
+
+        let amm = AmmPoolClient::new(&env, &amm_addr);
+        amm.initialize(
+            &admin,
+            &ta.address,
+            &tb.address,
+            &lp_addr,
+            &30_i128,
+            &admin,
+            &0_i128,
+        );
+
+        let provider = Address::generate(&env);
+        ta_sac.mint(&provider, &2_000_000_i128);
+        tb_sac.mint(&provider, &2_000_000_i128);
+        amm.add_liquidity(
+            &provider,
+            &2_000_000_i128,
+            &2_000_000_i128,
+            &0_i128,
+            &10_000_u64,
+        );
+
+        let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+        consumer.save_snapshot(&amm_addr);
+
+        env.ledger().set_timestamp(10_060);
+        let whale = Address::generate(&env);
+        ta_sac.mint(&whale, &1_000_000_i128);
+        amm.swap(
+            &whale,
+            &ta.address,
+            &1_000_000_i128,
+            &0_i128,
+            &10_060_u64,
+            &None,
+        );
+
+        let (spot_a, _spot_b) = amm.price_ratio();
+        let validation =
+            consumer.validate_price_against_twap(&amm_addr, &60_u64, &spot_a, &500_i128);
+
+        assert_eq!(validation.twap_price, 1_000_000);
+        assert_eq!(validation.max_deviation_bps, 500);
+        assert!(validation.deviation_bps > 500);
+        assert!(validation.is_deviation);
+    }
+
+    #[test]
+    fn test_lending_helper_accepts_safe_price_and_rejects_manipulated_price() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+
+        let admin = Address::generate(&env);
+        let amm_addr = env.register_contract(None, AmmPool);
+        let lp_addr = env.register_contract(None, LpToken);
+        let consumer_addr = env.register_contract(None, TwapConsumer);
+
+        token::LpTokenClient::new(&env, &lp_addr).initialize(
+            &amm_addr,
+            &soroban_sdk::String::from_str(&env, "AMM LP Token"),
+            &soroban_sdk::String::from_str(&env, "ALP"),
+            &7u32,
+        );
+
+        let (ta, ta_sac) = create_sac(&env, &admin);
+        let (tb, tb_sac) = create_sac(&env, &admin);
+
+        let amm = AmmPoolClient::new(&env, &amm_addr);
+        amm.initialize(
+            &admin,
+            &ta.address,
+            &tb.address,
+            &lp_addr,
+            &30_i128,
+            &admin,
+            &0_i128,
+        );
+
+        let provider = Address::generate(&env);
+        ta_sac.mint(&provider, &2_000_000_i128);
+        tb_sac.mint(&provider, &2_000_000_i128);
+        amm.add_liquidity(
+            &provider,
+            &2_000_000_i128,
+            &2_000_000_i128,
+            &0_i128,
+            &10_000_u64,
+        );
+
+        let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+        consumer.save_snapshot(&amm_addr);
+
+        env.ledger().set_timestamp(10_060);
+        let trader = Address::generate(&env);
+        ta_sac.mint(&trader, &1_000_i128);
+        amm.swap(
+            &trader,
+            &ta.address,
+            &1_000_i128,
+            &0_i128,
+            &10_060_u64,
+            &None,
+        );
+
+        let (safe_spot, _spot_b) = amm.price_ratio();
+        let collateral_value = consumer.assert_lending_price_safe(
+            &amm_addr,
+            &60_u64,
+            &safe_spot,
+            &500_i128,
+            &3_000_000_i128,
+        );
+        assert!(collateral_value > 0);
+
+        let manipulated_spot = 600_000_i128;
+        let result = consumer.try_assert_lending_price_safe(
+            &amm_addr,
+            &60_u64,
+            &manipulated_spot,
+            &500_i128,
+            &3_000_000_i128,
+        );
+        assert!(result.is_err());
     }
 
     #[test]
@@ -467,7 +703,15 @@ mod tests {
         let (ta1, ta1_sac) = create_sac(&env, &admin);
         let (tb1, tb1_sac) = create_sac(&env, &admin);
         let amm1 = AmmPoolClient::new(&env, &amm_addr1);
-        amm1.initialize(&admin, &ta1.address, &tb1.address, &lp_addr1, &30_i128, &admin, &0_i128);
+        amm1.initialize(
+            &admin,
+            &ta1.address,
+            &tb1.address,
+            &lp_addr1,
+            &30_i128,
+            &admin,
+            &0_i128,
+        );
         let p1 = Address::generate(&env);
         ta1_sac.mint(&p1, &2_000_000_i128);
         tb1_sac.mint(&p1, &2_000_000_i128);
@@ -485,7 +729,15 @@ mod tests {
         let (ta2, ta2_sac) = create_sac(&env, &admin);
         let (tb2, tb2_sac) = create_sac(&env, &admin);
         let amm2 = AmmPoolClient::new(&env, &amm_addr2);
-        amm2.initialize(&admin, &ta2.address, &tb2.address, &lp_addr2, &30_i128, &admin, &0_i128);
+        amm2.initialize(
+            &admin,
+            &ta2.address,
+            &tb2.address,
+            &lp_addr2,
+            &30_i128,
+            &admin,
+            &0_i128,
+        );
         let p2 = Address::generate(&env);
         ta2_sac.mint(&p2, &2_000_000_i128);
         tb2_sac.mint(&p2, &4_000_000_i128);
@@ -512,10 +764,24 @@ mod tests {
         env.ledger().set_timestamp(10_060);
         let whale1 = Address::generate(&env);
         ta1_sac.mint(&whale1, &1_000_i128);
-        amm1.swap(&whale1, &ta1.address, &1_000_i128, &0_i128, &10_060_u64, &None);
+        amm1.swap(
+            &whale1,
+            &ta1.address,
+            &1_000_i128,
+            &0_i128,
+            &10_060_u64,
+            &None,
+        );
         let whale2 = Address::generate(&env);
         ta2_sac.mint(&whale2, &1_000_i128);
-        amm2.swap(&whale2, &ta2.address, &1_000_i128, &0_i128, &10_060_u64, &None);
+        amm2.swap(
+            &whale2,
+            &ta2.address,
+            &1_000_i128,
+            &0_i128,
+            &10_060_u64,
+            &None,
+        );
 
         // get_twap_all must return TWAPs for both pools.
         let all_twaps = consumer.get_twap_all(&60_u64);
