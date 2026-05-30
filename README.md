@@ -282,6 +282,9 @@ An integration contract that reads the AMM's cumulative price oracle and compute
 |---|---|
 | `save_snapshot(pool)` | Stores `(cum_a, cum_b, pool_ts)` under `Snapshot(pool, pool_ts)` |
 | `get_twap_price(pool, window_seconds) → i128` | Returns `(cum_a_now - cum_a_then) / window_seconds`, where `cum_a_then` comes from the snapshot at `now_ts - window_seconds` |
+| `validate_price(spot_price, twap_price, max_deviation_bps) → PriceValidation` | Compares a real-time price against TWAP and flags deviations above a configurable basis-point threshold |
+| `validate_price_against_twap(pool, window_seconds, spot_price, max_deviation_bps) → PriceValidation` | Reads TWAP from saved snapshots and validates the supplied AMM spot price |
+| `assert_lending_price_safe(pool, window_seconds, spot_price, max_deviation_bps, collateral_amount) → i128` | Lending integration helper that reverts on manipulated prices and returns collateral value when safe |
 
 ---
 
@@ -815,11 +818,27 @@ stellar contract invoke \
   --window_seconds 60
 ```
 
+4. Validate the real-time AMM spot price against TWAP before accepting it in another protocol:
+
+```sh
+stellar contract invoke \
+  --id <TWAP_CONSUMER_CONTRACT_ID> \
+  --network testnet --source <YOUR_KEY> \
+  -- validate_price_against_twap \
+  --pool <AMM_CONTRACT_ID> \
+  --window_seconds 60 \
+  --spot_price <AMM_PRICE_RATIO_A> \
+  --max_deviation_bps 500
+```
+
+Lending contracts can call `assert_lending_price_safe` before valuing collateral. The helper reverts when the real-time spot price differs from TWAP by more than `max_deviation_bps`, preventing a flash-loan-moved spot price from being used as the collateral oracle.
+
 Notes:
 
 - `window_seconds` must be greater than 0.
 - `save_snapshot` must have been called at approximately `now_ts - window_seconds`.
 - Returned TWAP is scaled the same way as AMM spot price (`1_000_000` scale factor).
+- `max_deviation_bps` is configurable per integration; for example, `500` allows a 5% spot/TWAP difference.
 
 ### TypeScript Client Example
 
