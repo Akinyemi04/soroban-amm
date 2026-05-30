@@ -4,6 +4,9 @@ members = [
   "contracts/amm",
   "contracts/token",
   "contracts/factory",
+  "contracts/router",
+  "contracts/reserve_manager",
+  "contracts/amm-fuzz",
 ]
 
 [workspace.dependencies]
