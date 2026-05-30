@@ -62,6 +62,12 @@ pub enum AmmError {
     /// operation was already in progress. The receiver contract must not
     /// call back into this pool during an `on_flash_loan` callback.
     Reentrant            = 14,
+    /// The circuit breaker tripped: spot price deviated more than the
+    /// configured threshold in a single block.  The pool has been
+    /// automatically paused.  Recovery requires the cooldown period to
+    /// elapse and a call to `try_circuit_breaker_recovery`, or a direct
+    /// admin/governance `unpause`.
+    CircuitBreaker       = 15,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -92,6 +98,22 @@ pub enum DataKey {
     /// Set to `true` while a flash loan is executing to block reentrant calls.
     /// Cleared to `false` after the callback returns and repayment is verified.
     Locked,
+    // Circuit breaker
+    /// Price deviation threshold in bps above which the circuit breaker trips
+    /// (default 5 000 = 50 %).  Configurable via `set_circuit_breaker_config`.
+    CircuitBreakerThresholdBps,
+    /// Minimum seconds that must elapse after the circuit breaker trips before
+    /// automatic recovery is attempted (default 600 s = 10 min).
+    CircuitBreakerCooldown,
+    /// Ledger timestamp at which the circuit breaker was last triggered.
+    /// `0` when not triggered.
+    CircuitBreakerTriggeredAt,
+    /// Spot price (reserve_b * 1_000_000 / reserve_a) captured at the
+    /// beginning of the current ledger sequence.  Used to measure intra-block
+    /// price deviation.
+    CircuitBreakerLastPrice,
+    /// Ledger sequence number at which `CircuitBreakerLastPrice` was captured.
+    CircuitBreakerLastSeqno,
 }
 
 // ── Pool info returned by `get_info` ─────────────────────────────────────────
@@ -137,6 +159,21 @@ pub struct SwapSimulation {
     pub price_impact_bps: i128, // price impact in basis points
     pub effective_price: i128,  // amount_out / amount_in scaled by 1_000_000
     pub spot_price: i128,       // reserve_out / reserve_in scaled by 1_000_000
+}
+
+/// Circuit breaker configuration and current state returned by
+/// `get_circuit_breaker_config`.
+#[contracttype]
+#[derive(Debug, Clone, PartialEq)]
+pub struct CircuitBreakerConfig {
+    /// Price deviation threshold in bps (e.g. 5 000 = 50 %).
+    pub threshold_bps: i128,
+    /// Minimum cooldown seconds before automatic recovery.
+    pub cooldown_secs: u64,
+    /// Timestamp at which the circuit breaker last tripped (0 = never).
+    pub triggered_at: u64,
+    /// Whether the circuit breaker is currently active (pool paused by CB).
+    pub tripped: bool,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -248,6 +285,22 @@ impl AmmPool {
             .set(&DataKey::LastTimestamp, &env.ledger().timestamp());
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().set(&DataKey::Locked, &false);
+        // Circuit breaker: default threshold 50 % (5 000 bps), cooldown 600 s.
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerThresholdBps, &5_000_i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerCooldown, &600_u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerTriggeredAt, &0_u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerLastPrice, &0_i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerLastSeqno, &0_u32);
         Ok(())
     }
 
@@ -281,6 +334,187 @@ impl AmmPool {
     /// internally by `enter_lock`.
     pub fn flash_loan_locked(env: Env) -> bool {
         Self::is_locked(&env)
+    }
+
+    // ── Circuit breaker ───────────────────────────────────────────────────────
+
+    /// Configure the circuit breaker.
+    ///
+    /// # Parameters
+    /// - `threshold_bps` – Maximum allowed intra-block spot-price deviation in
+    ///   basis points before the pool is auto-paused (e.g. `5_000` = 50 %).
+    ///   Must be in `(0, 10_000]`.
+    /// - `cooldown_secs` – Minimum seconds that must pass after tripping before
+    ///   automatic recovery via `try_circuit_breaker_recovery` is allowed.
+    ///
+    /// Admin-only.
+    pub fn set_circuit_breaker_config(
+        env: Env,
+        threshold_bps: i128,
+        cooldown_secs: u64,
+    ) -> Result<(), AmmError> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        if threshold_bps <= 0 || threshold_bps > 10_000 {
+            return Err(AmmError::InvalidFeeBps);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerThresholdBps, &threshold_bps);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerCooldown, &cooldown_secs);
+        env.events().publish(
+            (Symbol::new(&env, "cb_config"),),
+            (threshold_bps, cooldown_secs),
+        );
+        Ok(())
+    }
+
+    /// Return the current circuit breaker configuration and state.
+    pub fn get_circuit_breaker_config(env: Env) -> CircuitBreakerConfig {
+        let threshold_bps: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerThresholdBps)
+            .unwrap_or(5_000);
+        let cooldown_secs: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerCooldown)
+            .unwrap_or(600);
+        let triggered_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerTriggeredAt)
+            .unwrap_or(0);
+        let tripped = triggered_at > 0 && Self::is_paused(env.clone());
+        CircuitBreakerConfig {
+            threshold_bps,
+            cooldown_secs,
+            triggered_at,
+            tripped,
+        }
+    }
+
+    /// Attempt automatic recovery after the circuit breaker cooldown.
+    ///
+    /// If the pool was paused by the circuit breaker and the cooldown period
+    /// has elapsed, this function unpauses the pool and resets the circuit
+    /// breaker state.  Anyone may call this — no auth required — so that
+    /// keepers and bots can restore normal operation without governance
+    /// intervention.
+    ///
+    /// Returns `Ok(true)` if recovery was performed, `Ok(false)` if the pool
+    /// was not tripped or the cooldown has not elapsed yet.
+    pub fn try_circuit_breaker_recovery(env: Env) -> Result<bool, AmmError> {
+        let triggered_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerTriggeredAt)
+            .unwrap_or(0);
+        if triggered_at == 0 {
+            return Ok(false);
+        }
+        if !Self::is_paused(env.clone()) {
+            // Already manually unpaused; clear the CB state.
+            env.storage()
+                .instance()
+                .set(&DataKey::CircuitBreakerTriggeredAt, &0_u64);
+            return Ok(false);
+        }
+        let cooldown: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerCooldown)
+            .unwrap_or(600);
+        let now = env.ledger().timestamp();
+        if now < triggered_at + cooldown {
+            return Ok(false);
+        }
+        // Cooldown elapsed — unpause and reset.
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerTriggeredAt, &0_u64);
+        env.events()
+            .publish((Symbol::new(&env, "cb_recovered"),), (now,));
+        Ok(true)
+    }
+
+    /// Internal: capture the spot price at the start of a new ledger sequence.
+    ///
+    /// Called at the top of every state-mutating function (via
+    /// `check_circuit_breaker`).  On the first call within a given ledger
+    /// sequence the current spot price is recorded as the baseline.  On
+    /// subsequent calls within the same sequence the deviation from that
+    /// baseline is measured; if it exceeds the threshold the pool is
+    /// auto-paused and `AmmError::CircuitBreaker` is returned.
+    fn check_circuit_breaker(env: &Env) -> Result<(), AmmError> {
+        let reserve_a = Self::get_reserve_a(env.clone());
+        let reserve_b = Self::get_reserve_b(env.clone());
+        // Skip the check when the pool has no liquidity yet.
+        if reserve_a <= 0 || reserve_b <= 0 {
+            return Ok(());
+        }
+
+        let threshold_bps: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerThresholdBps)
+            .unwrap_or(5_000);
+
+        let current_seqno = env.ledger().sequence();
+        let last_seqno: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerLastSeqno)
+            .unwrap_or(0);
+        let current_price = reserve_b * 1_000_000 / reserve_a;
+
+        if last_seqno != current_seqno {
+            // New ledger sequence: record baseline price.
+            env.storage()
+                .instance()
+                .set(&DataKey::CircuitBreakerLastPrice, &current_price);
+            env.storage()
+                .instance()
+                .set(&DataKey::CircuitBreakerLastSeqno, &current_seqno);
+            return Ok(());
+        }
+
+        // Same ledger sequence: measure deviation from baseline.
+        let baseline_price: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerLastPrice)
+            .unwrap_or(current_price);
+
+        if baseline_price <= 0 {
+            return Ok(());
+        }
+
+        let deviation_bps = if current_price >= baseline_price {
+            (current_price - baseline_price) * 10_000 / baseline_price
+        } else {
+            (baseline_price - current_price) * 10_000 / baseline_price
+        };
+
+        if deviation_bps >= threshold_bps {
+            // Trip the circuit breaker: auto-pause the pool.
+            let now = env.ledger().timestamp();
+            env.storage().instance().set(&DataKey::Paused, &true);
+            env.storage()
+                .instance()
+                .set(&DataKey::CircuitBreakerTriggeredAt, &now);
+            env.events().publish(
+                (Symbol::new(env, "circuit_break"),),
+                (baseline_price, current_price, deviation_bps, threshold_bps),
+            );
+            return Err(AmmError::CircuitBreaker);
+        }
+
+        Ok(())
     }
 
     /// Update the protocol fee configuration. Admin-only.
@@ -995,6 +1229,10 @@ impl AmmPool {
         // Checkpoint TWAP before updating reserves.
         Self::checkpoint_twap(&env);
 
+        // Circuit breaker: check intra-block price deviation BEFORE the swap
+        // changes the reserves so the baseline is the pre-trade price.
+        Self::check_circuit_breaker(&env)?;
+
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
 
@@ -1144,6 +1382,9 @@ impl AmmPool {
 
         // Checkpoint TWAP before updating reserves.
         Self::checkpoint_twap(&env);
+
+        // Circuit breaker check before state mutation.
+        Self::check_circuit_breaker(&env)?;
 
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
@@ -1311,6 +1552,9 @@ impl AmmPool {
 
         // Checkpoint TWAP before updating reserves.
         Self::checkpoint_twap(&env);
+
+        // Circuit breaker check before borrowing funds.
+        Self::check_circuit_breaker(&env)?;
 
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
