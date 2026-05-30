@@ -1676,39 +1676,16 @@
           "v0": {
             "topics": [
               {
-                "symbol": "log"
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "add_liquidity"
               }
             ],
             "data": {
-              "vec": [
-                {
-                  "string": "caught panic 'slippage: insufficient shares minted: computed=1000000, minimum=1000001' from contract function 'Symbol(obj#383)'"
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
-                },
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 1000000
-                  }
-                },
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 1000000
-                  }
-                },
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 1000001
-                  }
-                },
-                {
-                  "u64": 18446744073709551615
-                }
-              ]
+              "error": {
+                "contract": 5
+              }
             }
           }
         }
@@ -1728,12 +1705,12 @@
               },
               {
                 "error": {
-                  "wasm_vm": "invalid_action"
+                  "contract": 5
                 }
               }
             ],
             "data": {
-              "string": "caught error from function"
+              "string": "escalating Ok(ScErrorType::Contract) frame-exit to Err"
             }
           }
         }
@@ -1753,7 +1730,7 @@
               },
               {
                 "error": {
-                  "wasm_vm": "invalid_action"
+                  "contract": 5
                 }
               }
             ],

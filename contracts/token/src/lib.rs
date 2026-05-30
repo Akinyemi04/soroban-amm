@@ -184,7 +184,7 @@ impl LpToken {
         );
         env.storage()
             .persistent()
-            .set(&DataKey::Balance(from), &(bal - amount));
+            .set(&DataKey::Balance(from.clone()), &(bal - amount));
         let supply: i128 = Self::total_supply(env.clone());
         env.storage()
             .instance()
