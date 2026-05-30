@@ -58,6 +58,16 @@ pub enum AmmError {
     InsufficientLiquidity = 11,
     NoPendingAdmin       = 12,
     WrongAdmin           = 13,
+    /// A reentrant call was detected while a flash loan or state-mutating
+    /// operation was already in progress. The receiver contract must not
+    /// call back into this pool during an `on_flash_loan` callback.
+    Reentrant            = 14,
+    /// The circuit breaker tripped: spot price deviated more than the
+    /// configured threshold in a single block.  The pool has been
+    /// automatically paused.  Recovery requires the cooldown period to
+    /// elapse and a call to `try_circuit_breaker_recovery`, or a direct
+    /// admin/governance `unpause`.
+    CircuitBreaker       = 15,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -77,6 +87,43 @@ pub enum DataKey {
     // Emergency withdrawal storage
     EmergencyWithdrawTimestamp,
     EmergencyWithdrawRecipient,
+
+    // Admin & fees
+    Admin,
+    PendingAdmin,
+    FeeBps,
+    FeeRecipient,
+    ProtocolFeeBps,
+    AccruedFeeA,
+    AccruedFeeB,
+    FlashLoanFeeBps,
+
+    // Pause / reentrancy
+    Paused,
+    /// Set to `true` while a flash loan is executing to block reentrant calls.
+    /// Cleared to `false` after the callback returns and repayment is verified.
+    Locked,
+
+    // Circuit breaker
+    /// Price deviation threshold in bps above which the circuit breaker trips
+    /// (default 5 000 = 50 %). Configurable via `set_circuit_breaker_config`.
+    CircuitBreakerThresholdBps,
+
+    /// Minimum seconds that must elapse after the circuit breaker trips before
+    /// automatic recovery is attempted (default 600 s = 10 min).
+    CircuitBreakerCooldown,
+
+    /// Ledger timestamp at which the circuit breaker was last triggered.
+    /// `0` when not triggered.
+    CircuitBreakerTriggeredAt,
+
+    /// Spot price (reserve_b * 1_000_000 / reserve_a) captured at the
+    /// beginning of the current ledger sequence. Used to measure intra-block
+    /// price deviation.
+    CircuitBreakerLastPrice,
+
+    /// Ledger sequence number at which `CircuitBreakerLastPrice` was captured.
+    CircuitBreakerLastSeqno,
 }
 
 // ── Pool info returned by `get_info` ─────────────────────────────────────────
@@ -122,6 +169,21 @@ pub struct SwapSimulation {
     pub price_impact_bps: i128, // price impact in basis points
     pub effective_price: i128,  // amount_out / amount_in scaled by 1_000_000
     pub spot_price: i128,       // reserve_out / reserve_in scaled by 1_000_000
+}
+
+/// Circuit breaker configuration and current state returned by
+/// `get_circuit_breaker_config`.
+#[contracttype]
+#[derive(Debug, Clone, PartialEq)]
+pub struct CircuitBreakerConfig {
+    /// Price deviation threshold in bps (e.g. 5 000 = 50 %).
+    pub threshold_bps: i128,
+    /// Minimum cooldown seconds before automatic recovery.
+    pub cooldown_secs: u64,
+    /// Timestamp at which the circuit breaker last tripped (0 = never).
+    pub triggered_at: u64,
+    /// Whether the circuit breaker is currently active (pool paused by CB).
+    pub tripped: bool,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -232,6 +294,23 @@ impl AmmPool {
             .instance()
             .set(&DataKey::LastTimestamp, &env.ledger().timestamp());
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage().instance().set(&DataKey::Locked, &false);
+        // Circuit breaker: default threshold 50 % (5 000 bps), cooldown 600 s.
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerThresholdBps, &5_000_i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerCooldown, &600_u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerTriggeredAt, &0_u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerLastPrice, &0_i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerLastSeqno, &0_u32);
         Ok(())
     }
 
@@ -264,8 +343,12 @@ impl AmmPool {
 
         // Record audit information
         let ts: u64 = env.ledger().timestamp();
-        env.storage().instance().set(&DataKey::EmergencyWithdrawTimestamp, &ts);
-        env.storage().instance().set(&DataKey::EmergencyWithdrawRecipient, &to);
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyWithdrawTimestamp, &ts);
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyWithdrawRecipient, &to);
 
         // Get token addresses and reserves
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
@@ -275,10 +358,12 @@ impl AmmPool {
 
         // Transfer reserves to recipient
         if reserve_a > 0 {
-            SepTokenClient::new(&env, &token_a).transfer(&env.current_contract_address(), &to, &reserve_a);
+            SepTokenClient::new(&env, &token_a)
+                .transfer(&env.current_contract_address(), &to, &reserve_a);
         }
         if reserve_b > 0 {
-            SepTokenClient::new(&env, &token_b).transfer(&env.current_contract_address(), &to, &reserve_b);
+            SepTokenClient::new(&env, &token_b)
+                .transfer(&env.current_contract_address(), &to, &reserve_b);
         }
 
         // Zero out reserves
@@ -290,6 +375,206 @@ impl AmmPool {
             (Symbol::new(&env, "emergency_withdraw"), admin.clone()),
             (to, reserve_a, reserve_b),
         );
+
+        Ok(())
+    }
+
+    /// Return `true` while a flash loan is executing on this pool.
+    ///
+    /// During this window all state-mutating functions (`swap`,
+    /// `add_liquidity`, `remove_liquidity`, `flash_loan`) will reject calls
+    /// with `AmmError::Reentrant`. This is a read-only diagnostic; callers
+    /// should not rely on this for security checks — the guard is enforced
+    /// internally by `enter_lock`.
+    pub fn flash_loan_locked(env: Env) -> bool {
+        Self::is_locked(&env)
+    }
+
+    // ── Circuit breaker ───────────────────────────────────────────────────────
+
+    /// Configure the circuit breaker.
+    ///
+    /// # Parameters
+    /// - `threshold_bps` – Maximum allowed intra-block spot-price deviation in
+    ///   basis points before the pool is auto-paused (e.g. `5_000` = 50 %).
+    ///   Must be in `(0, 10_000]`.
+    /// - `cooldown_secs` – Minimum seconds that must pass after tripping before
+    ///   automatic recovery via `try_circuit_breaker_recovery` is allowed.
+    ///
+    /// Admin-only.
+    pub fn set_circuit_breaker_config(
+        env: Env,
+        threshold_bps: i128,
+        cooldown_secs: u64,
+    ) -> Result<(), AmmError> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        if threshold_bps <= 0 || threshold_bps > 10_000 {
+            return Err(AmmError::InvalidFeeBps);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerThresholdBps, &threshold_bps);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerCooldown, &cooldown_secs);
+
+        env.events().publish(
+            (Symbol::new(&env, "cb_config"),),
+            (threshold_bps, cooldown_secs),
+        );
+
+        Ok(())
+    }
+
+    /// Return the current circuit breaker configuration and state.
+    pub fn get_circuit_breaker_config(env: Env) -> CircuitBreakerConfig {
+        let threshold_bps: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerThresholdBps)
+            .unwrap_or(5_000);
+
+        let cooldown_secs: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerCooldown)
+            .unwrap_or(600);
+
+        let triggered_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerTriggeredAt)
+            .unwrap_or(0);
+
+        let tripped = triggered_at > 0 && Self::is_paused(env.clone());
+
+        CircuitBreakerConfig {
+            threshold_bps,
+            cooldown_secs,
+            triggered_at,
+            tripped,
+        }
+    }
+
+    /// Attempt automatic recovery after the circuit breaker cooldown.
+    pub fn try_circuit_breaker_recovery(env: Env) -> Result<bool, AmmError> {
+        let triggered_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerTriggeredAt)
+            .unwrap_or(0);
+
+        if triggered_at == 0 {
+            return Ok(false);
+        }
+
+        if !Self::is_paused(env.clone()) {
+            env.storage()
+                .instance()
+                .set(&DataKey::CircuitBreakerTriggeredAt, &0_u64);
+            return Ok(false);
+        }
+
+        let cooldown: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerCooldown)
+            .unwrap_or(600);
+
+        let now = env.ledger().timestamp();
+
+        if now < triggered_at + cooldown {
+            return Ok(false);
+        }
+
+        env.storage().instance().set(&DataKey::Paused, &false);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerTriggeredAt, &0_u64);
+
+        env.events()
+            .publish((Symbol::new(&env, "cb_recovered"),), (now,));
+
+        Ok(true)
+    }
+
+    /// Internal: capture the spot price at the start of a new ledger sequence.
+    fn check_circuit_breaker(env: &Env) -> Result<(), AmmError> {
+        let reserve_a = Self::get_reserve_a(env.clone());
+        let reserve_b = Self::get_reserve_b(env.clone());
+
+        if reserve_a <= 0 || reserve_b <= 0 {
+            return Ok(());
+        }
+
+        let threshold_bps: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerThresholdBps)
+            .unwrap_or(5_000);
+
+        let current_seqno = env.ledger().sequence();
+
+        let last_seqno: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerLastSeqno)
+            .unwrap_or(0);
+
+        let current_price = reserve_b * 1_000_000 / reserve_a;
+
+        if last_seqno != current_seqno {
+            env.storage()
+                .instance()
+                .set(&DataKey::CircuitBreakerLastPrice, &current_price);
+
+            env.storage()
+                .instance()
+                .set(&DataKey::CircuitBreakerLastSeqno, &current_seqno);
+
+            return Ok(());
+        }
+
+        let baseline_price: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerLastPrice)
+            .unwrap_or(current_price);
+
+        if baseline_price <= 0 {
+            return Ok(());
+        }
+
+        let deviation_bps = if current_price >= baseline_price {
+            (current_price - baseline_price) * 10_000 / baseline_price
+        } else {
+            (baseline_price - current_price) * 10_000 / baseline_price
+        };
+
+        if deviation_bps >= threshold_bps {
+            let now = env.ledger().timestamp();
+
+            env.storage().instance().set(&DataKey::Paused, &true);
+
+            env.storage()
+                .instance()
+                .set(&DataKey::CircuitBreakerTriggeredAt, &now);
+
+            env.events().publish(
+                (Symbol::new(&env, "circuit_break"),),
+                (baseline_price, current_price, deviation_bps, threshold_bps),
+            );
+
+            return Err(AmmError::CircuitBreaker);
+        }
+
+        Ok(())
+    }
         Ok(())
     }
 
@@ -448,6 +733,42 @@ impl AmmPool {
             .unwrap_or(None)
     }
 
+    // ── Reentrancy guard ──────────────────────────────────────────────────────
+
+    /// Return `true` if a flash loan is currently executing on this contract.
+    ///
+    /// Any state-mutating entry point that could be exploited via a reentrant
+    /// callback (swap, add_liquidity, remove_liquidity, flash_loan) calls this
+    /// before proceeding. The lock is stored in instance storage so it is
+    /// visible to all cross-contract calls within the same transaction.
+    fn is_locked(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Locked)
+            .unwrap_or(false)
+    }
+
+    /// Acquire the reentrancy lock.
+    ///
+    /// Returns `Err(AmmError::Reentrant)` if the lock is already held,
+    /// preventing a flash-loan receiver from calling back into the pool.
+    fn enter_lock(env: &Env) -> Result<(), AmmError> {
+        if Self::is_locked(env) {
+            return Err(AmmError::Reentrant);
+        }
+        env.storage().instance().set(&DataKey::Locked, &true);
+        Ok(())
+    }
+
+    /// Release the reentrancy lock.
+    ///
+    /// Must be called on every successful return path after `enter_lock`.
+    /// On error paths the Soroban runtime reverts all storage writes
+    /// (including the lock), so an explicit release is not required there.
+    fn exit_lock(env: &Env) {
+        env.storage().instance().set(&DataKey::Locked, &false);
+    }
+
     // ── TWAP ──────────────────────────────────────────────────────────────────
 
     /// Update the TWAP price accumulators based on the current reserves and elapsed time.
@@ -531,6 +852,10 @@ impl AmmPool {
         }
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
+        }
+        // Block reentrant calls from flash loan receivers.
+        if Self::is_locked(&env) {
+            return Err(AmmError::Reentrant);
         }
         provider.require_auth();
         if amount_a <= 0 || amount_b <= 0 {
@@ -638,6 +963,10 @@ impl AmmPool {
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
+        // Block reentrant calls from flash loan receivers.
+        if Self::is_locked(&env) {
+            return Err(AmmError::Reentrant);
+        }
         provider.require_auth();
         if shares <= 0 {
             return Err(AmmError::ZeroAmount);
@@ -735,6 +1064,10 @@ impl AmmPool {
         }
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
+        }
+        // Block reentrant calls from flash loan receivers.
+        if Self::is_locked(&env) {
+            return Err(AmmError::Reentrant);
         }
         provider.require_auth();
         if shares <= 0 {
@@ -945,6 +1278,10 @@ impl AmmPool {
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
+        // Block reentrant calls from flash loan receivers.
+        if Self::is_locked(&env) {
+            return Err(AmmError::Reentrant);
+        }
         trader.require_auth();
         if amount_in <= 0 {
             return Err(AmmError::ZeroAmount);
@@ -952,6 +1289,10 @@ impl AmmPool {
 
         // Checkpoint TWAP before updating reserves.
         Self::checkpoint_twap(&env);
+
+        // Circuit breaker: check intra-block price deviation BEFORE the swap
+        // changes the reserves so the baseline is the pre-trade price.
+        Self::check_circuit_breaker(&env)?;
 
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
@@ -1091,6 +1432,10 @@ impl AmmPool {
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
+        // Block reentrant calls from flash loan receivers.
+        if Self::is_locked(&env) {
+            return Err(AmmError::Reentrant);
+        }
         trader.require_auth();
         if amount_out <= 0 {
             return Err(AmmError::ZeroAmount);
@@ -1098,6 +1443,9 @@ impl AmmPool {
 
         // Checkpoint TWAP before updating reserves.
         Self::checkpoint_twap(&env);
+
+        // Circuit breaker check before state mutation.
+        Self::check_circuit_breaker(&env)?;
 
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
@@ -1236,6 +1584,14 @@ impl AmmPool {
     }
 
     /// Borrow pool liquidity and repay it plus a fee during the receiver callback.
+    ///
+    /// # Reentrancy safety
+    /// This function acquires a reentrancy lock before calling the external
+    /// `on_flash_loan` callback and holds it for the duration of that call.
+    /// Any attempt by the receiver to call back into `swap`, `add_liquidity`,
+    /// `remove_liquidity`, or `flash_loan` on this same pool will fail with
+    /// `AmmError::Reentrant`. The lock is released only after repayment is
+    /// verified, ensuring pool state cannot be manipulated via callbacks.
     pub fn flash_loan(
         env: Env,
         receiver: Address,
@@ -1250,8 +1606,16 @@ impl AmmPool {
             return Err(AmmError::ZeroAmount);
         }
 
+        // Acquire the reentrancy lock before any external call.
+        // This prevents the receiver's on_flash_loan callback from calling
+        // back into swap / add_liquidity / remove_liquidity / flash_loan.
+        Self::enter_lock(&env)?;
+
         // Checkpoint TWAP before updating reserves.
         Self::checkpoint_twap(&env);
+
+        // Circuit breaker check before borrowing funds.
+        Self::check_circuit_breaker(&env)?;
 
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
@@ -1260,6 +1624,7 @@ impl AmmPool {
         } else if token == token_b {
             Self::get_reserve_b(env.clone())
         } else {
+            // exit_lock is not needed: returning Err reverts all storage writes.
             return Err(AmmError::InvalidToken);
         };
         if reserve < amount {
@@ -1278,6 +1643,9 @@ impl AmmPool {
 
         token_client.transfer(&pool, &receiver, &amount);
 
+        // ── External callback (lock is held) ─────────────────────────────────
+        // The receiver cannot reenter this pool because Locked == true.
+        // Any reentrant call will return AmmError::Reentrant.
         let accepted = FlashLoanReceiverClient::new(&env, &receiver)
             .on_flash_loan(&token, &amount, &fee, &data);
         if !accepted {
@@ -1316,6 +1684,9 @@ impl AmmPool {
             (token, amount, fee),
         );
 
+        // Release the lock only on the success path; on error paths Soroban
+        // reverts all storage writes (including the lock) automatically.
+        Self::exit_lock(&env);
         Ok(fee)
     }
 

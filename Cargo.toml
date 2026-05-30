@@ -2,13 +2,12 @@
 resolver = "2"
 members = [
   "contracts/amm",
+  "contracts/amm-sdk",
   "contracts/concentrated_liquidity",
   "contracts/factory",
   "contracts/router",
   "contracts/batch_router",
   "contracts/token",
-  "contracts/factory",
-  "contracts/router",
   "contracts/reserve_manager",
   "contracts/amm-fuzz",
   "contracts/twap_consumer",
