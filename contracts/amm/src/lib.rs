@@ -58,6 +58,10 @@ pub enum AmmError {
     InsufficientLiquidity = 11,
     NoPendingAdmin       = 12,
     WrongAdmin           = 13,
+    /// A reentrant call was detected while a flash loan or state-mutating
+    /// operation was already in progress. The receiver contract must not
+    /// call back into this pool during an `on_flash_loan` callback.
+    Reentrant            = 14,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -74,7 +78,20 @@ pub enum DataKey {
     PriceCumulativeB,
     LastTimestamp,
     Shares(Address),
-
+    // Admin & fees
+    Admin,
+    PendingAdmin,
+    FeeBps,
+    FeeRecipient,
+    ProtocolFeeBps,
+    AccruedFeeA,
+    AccruedFeeB,
+    FlashLoanFeeBps,
+    // Pause / reentrancy
+    Paused,
+    /// Set to `true` while a flash loan is executing to block reentrant calls.
+    /// Cleared to `false` after the callback returns and repayment is verified.
+    Locked,
 }
 
 // ── Pool info returned by `get_info` ─────────────────────────────────────────
@@ -230,6 +247,7 @@ impl AmmPool {
             .instance()
             .set(&DataKey::LastTimestamp, &env.ledger().timestamp());
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage().instance().set(&DataKey::Locked, &false);
         Ok(())
     }
 
@@ -252,6 +270,17 @@ impl AmmPool {
             .instance()
             .get(&DataKey::Paused)
             .unwrap_or(false)
+    }
+
+    /// Return `true` while a flash loan is executing on this pool.
+    ///
+    /// During this window all state-mutating functions (`swap`,
+    /// `add_liquidity`, `remove_liquidity`, `flash_loan`) will reject calls
+    /// with `AmmError::Reentrant`. This is a read-only diagnostic; callers
+    /// should not rely on this for security checks — the guard is enforced
+    /// internally by `enter_lock`.
+    pub fn flash_loan_locked(env: Env) -> bool {
+        Self::is_locked(&env)
     }
 
     /// Update the protocol fee configuration. Admin-only.
@@ -409,6 +438,42 @@ impl AmmPool {
             .unwrap_or(None)
     }
 
+    // ── Reentrancy guard ──────────────────────────────────────────────────────
+
+    /// Return `true` if a flash loan is currently executing on this contract.
+    ///
+    /// Any state-mutating entry point that could be exploited via a reentrant
+    /// callback (swap, add_liquidity, remove_liquidity, flash_loan) calls this
+    /// before proceeding. The lock is stored in instance storage so it is
+    /// visible to all cross-contract calls within the same transaction.
+    fn is_locked(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Locked)
+            .unwrap_or(false)
+    }
+
+    /// Acquire the reentrancy lock.
+    ///
+    /// Returns `Err(AmmError::Reentrant)` if the lock is already held,
+    /// preventing a flash-loan receiver from calling back into the pool.
+    fn enter_lock(env: &Env) -> Result<(), AmmError> {
+        if Self::is_locked(env) {
+            return Err(AmmError::Reentrant);
+        }
+        env.storage().instance().set(&DataKey::Locked, &true);
+        Ok(())
+    }
+
+    /// Release the reentrancy lock.
+    ///
+    /// Must be called on every successful return path after `enter_lock`.
+    /// On error paths the Soroban runtime reverts all storage writes
+    /// (including the lock), so an explicit release is not required there.
+    fn exit_lock(env: &Env) {
+        env.storage().instance().set(&DataKey::Locked, &false);
+    }
+
     // ── TWAP ──────────────────────────────────────────────────────────────────
 
     /// Update the TWAP price accumulators based on the current reserves and elapsed time.
@@ -492,6 +557,10 @@ impl AmmPool {
         }
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
+        }
+        // Block reentrant calls from flash loan receivers.
+        if Self::is_locked(&env) {
+            return Err(AmmError::Reentrant);
         }
         provider.require_auth();
         if amount_a <= 0 || amount_b <= 0 {
@@ -599,6 +668,10 @@ impl AmmPool {
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
+        // Block reentrant calls from flash loan receivers.
+        if Self::is_locked(&env) {
+            return Err(AmmError::Reentrant);
+        }
         provider.require_auth();
         if shares <= 0 {
             return Err(AmmError::ZeroAmount);
@@ -696,6 +769,10 @@ impl AmmPool {
         }
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
+        }
+        // Block reentrant calls from flash loan receivers.
+        if Self::is_locked(&env) {
+            return Err(AmmError::Reentrant);
         }
         provider.require_auth();
         if shares <= 0 {
@@ -906,6 +983,10 @@ impl AmmPool {
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
+        // Block reentrant calls from flash loan receivers.
+        if Self::is_locked(&env) {
+            return Err(AmmError::Reentrant);
+        }
         trader.require_auth();
         if amount_in <= 0 {
             return Err(AmmError::ZeroAmount);
@@ -1052,6 +1133,10 @@ impl AmmPool {
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
+        // Block reentrant calls from flash loan receivers.
+        if Self::is_locked(&env) {
+            return Err(AmmError::Reentrant);
+        }
         trader.require_auth();
         if amount_out <= 0 {
             return Err(AmmError::ZeroAmount);
@@ -1197,6 +1282,14 @@ impl AmmPool {
     }
 
     /// Borrow pool liquidity and repay it plus a fee during the receiver callback.
+    ///
+    /// # Reentrancy safety
+    /// This function acquires a reentrancy lock before calling the external
+    /// `on_flash_loan` callback and holds it for the duration of that call.
+    /// Any attempt by the receiver to call back into `swap`, `add_liquidity`,
+    /// `remove_liquidity`, or `flash_loan` on this same pool will fail with
+    /// `AmmError::Reentrant`. The lock is released only after repayment is
+    /// verified, ensuring pool state cannot be manipulated via callbacks.
     pub fn flash_loan(
         env: Env,
         receiver: Address,
@@ -1211,6 +1304,11 @@ impl AmmPool {
             return Err(AmmError::ZeroAmount);
         }
 
+        // Acquire the reentrancy lock before any external call.
+        // This prevents the receiver's on_flash_loan callback from calling
+        // back into swap / add_liquidity / remove_liquidity / flash_loan.
+        Self::enter_lock(&env)?;
+
         // Checkpoint TWAP before updating reserves.
         Self::checkpoint_twap(&env);
 
@@ -1221,6 +1319,7 @@ impl AmmPool {
         } else if token == token_b {
             Self::get_reserve_b(env.clone())
         } else {
+            // exit_lock is not needed: returning Err reverts all storage writes.
             return Err(AmmError::InvalidToken);
         };
         if reserve < amount {
@@ -1239,6 +1338,9 @@ impl AmmPool {
 
         token_client.transfer(&pool, &receiver, &amount);
 
+        // ── External callback (lock is held) ─────────────────────────────────
+        // The receiver cannot reenter this pool because Locked == true.
+        // Any reentrant call will return AmmError::Reentrant.
         let accepted = FlashLoanReceiverClient::new(&env, &receiver)
             .on_flash_loan(&token, &amount, &fee, &data);
         if !accepted {
@@ -1277,6 +1379,9 @@ impl AmmPool {
             (token, amount, fee),
         );
 
+        // Release the lock only on the success path; on error paths Soroban
+        // reverts all storage writes (including the lock) automatically.
+        Self::exit_lock(&env);
         Ok(fee)
     }
 
