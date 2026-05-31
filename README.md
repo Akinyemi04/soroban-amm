@@ -33,6 +33,7 @@ A full-stack AMM protocol built on Stellar's Soroban smart contract platform. It
   - [Use the TWAP Oracle](#use-the-twap-oracle)
   - [TypeScript Client Example](#typescript-client-example)
   - [Python Client Example](#python-client-example)
+- [Off-chain Simulator](#off-chain-simulator)
 - [Contributing](#contributing)
 - [Changelog](#changelog)
 - [Security](#security)
@@ -862,6 +863,19 @@ python3 -m venv .venv
 pip install -r requirements.txt
 python client.py
 ```
+
+---
+
+## Off-chain Simulator
+
+The repository now includes `packages/amm-simulator`, a Rust library and CLI for:
+
+- swap simulation without gas costs
+- multi-step strategy testing
+- historical backtesting
+- Monte Carlo stress testing
+
+See [packages/amm-simulator/README.md](packages/amm-simulator/README.md) for the command-line usage and JSON formats.
 
 ---
 

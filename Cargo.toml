@@ -18,6 +18,7 @@ members = [
   "contracts/governance",
   "contracts/staking",
   "contracts/integration-tests",
+  "packages/amm-simulator",
 ]
 
 [workspace.dependencies]
