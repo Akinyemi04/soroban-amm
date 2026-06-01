@@ -1,0 +1,13 @@
+{
+  "name": "@example/ts-advanced-client",
+  "version": "0.1.0",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf lib"
+  },
+  "devDependencies": {
+    "typescript": "^4.9.5"
+  }
+}

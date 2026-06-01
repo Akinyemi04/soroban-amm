@@ -2,19 +2,24 @@
 resolver = "2"
 members = [
   "contracts/amm",
+  "contracts/amm-sdk",
   "contracts/concentrated_liquidity",
   "contracts/factory",
   "contracts/router",
   "contracts/batch_router",
+  "contracts/batch_auction",
   "contracts/token",
-  "contracts/factory",
-  "contracts/router",
   "contracts/reserve_manager",
   "contracts/amm-fuzz",
   "contracts/twap_consumer",
+  "contracts/twal_consumer",
+  "contracts/incentive_campaigns",
+  "contracts/dex_aggregator",
   "contracts/governance",
   "contracts/staking",
   "contracts/integration-tests",
+  "contracts/oracle_aggregator",
+  "contracts/cl_position_nft",
 ]
 
 [workspace.dependencies]

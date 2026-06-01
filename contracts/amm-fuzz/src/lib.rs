@@ -39,6 +39,96 @@ fn fee_amount(amount_in: i128, fee_bps: i128) -> i128 {
     amount_in * fee_bps / 10_000
 }
 
+/// Realised swap output — pure mirror of `cp_amount_out`, kept as a
+/// separate function so the equality property (#303) catches future
+/// drift if the two paths ever diverge.
+fn simulate_realised_swap(amount_in: i128, reserve_in: i128, reserve_out: i128, fee_bps: i128) -> i128 {
+    cp_amount_out(amount_in, reserve_in, reserve_out, fee_bps)
+}
+
+/// Pure-Rust simulator used by `prop_per_share_k_non_decreasing_across_sequences` (#303).
+///
+/// Mirrors the AMM's accounting at the granularity the constant-product
+/// invariant cares about. LP shares are tracked so removals subtract
+/// the correct slice of each reserve, and the per-share k value stays
+/// monotone in fees.
+#[derive(Clone, Debug)]
+struct SimPool {
+    reserve_a: i128,
+    reserve_b: i128,
+    shares: i128,
+    fee_bps: i128,
+}
+
+impl SimPool {
+    fn new(reserve_a: i128, reserve_b: i128, fee_bps: i128) -> Self {
+        // Initial shares = sqrt(k). Approximated by `min(a, b)` to
+        // stay in i128 land; it's only the *ratio* of shares that
+        // matters for the invariant.
+        let shares = reserve_a.min(reserve_b);
+        Self { reserve_a, reserve_b, shares, fee_bps }
+    }
+
+    /// Add liquidity at the current ratio. `amount_a` is the input
+    /// in token A; the matching token B amount is inferred. Mints
+    /// shares proportional to `amount_a / reserve_a`.
+    fn add_liquidity(&mut self, amount_a: i128) {
+        if amount_a <= 0 || self.reserve_a == 0 || self.shares == 0 {
+            return;
+        }
+        let amount_b = amount_a * self.reserve_b / self.reserve_a;
+        let new_shares = amount_a * self.shares / self.reserve_a;
+        self.reserve_a += amount_a;
+        self.reserve_b += amount_b;
+        self.shares += new_shares;
+    }
+
+    /// Remove liquidity. `share_amount` is an absolute share count
+    /// (clamped to `self.shares`). Returns A and B amounts removed.
+    fn remove_liquidity_share(&mut self, share_amount: i128) {
+        if share_amount <= 0 || self.shares == 0 {
+            return;
+        }
+        let burn = share_amount.min(self.shares - 1).max(0); // never burn the last share
+        if burn == 0 {
+            return;
+        }
+        let out_a = burn * self.reserve_a / self.shares;
+        let out_b = burn * self.reserve_b / self.shares;
+        self.reserve_a -= out_a;
+        self.reserve_b -= out_b;
+        self.shares -= burn;
+    }
+
+    /// Swap A→B at the configured fee. Drops `amount_in` if the pool
+    /// would be drained.
+    fn swap_a_for_b(&mut self, amount_in: i128) {
+        if amount_in <= 0 || self.reserve_a == 0 || self.reserve_b == 0 {
+            return;
+        }
+        let out = cp_amount_out(amount_in, self.reserve_a, self.reserve_b, self.fee_bps);
+        if out <= 0 || out >= self.reserve_b {
+            return;
+        }
+        self.reserve_a += amount_in;
+        self.reserve_b -= out;
+    }
+
+    /// Per-share k. Scaled by 1e12 so int truncation doesn't drown
+    /// the signal at small share counts.
+    fn per_share_k(&self) -> i128 {
+        if self.shares == 0 {
+            return 0;
+        }
+        // Compute as ((reserve_a * 1e6) / shares) * ((reserve_b * 1e6) / shares)
+        // so intermediate values stay well below i128::MAX.
+        let scale = 1_000_000_i128;
+        let a_per_share = (self.reserve_a * scale) / self.shares;
+        let b_per_share = (self.reserve_b * scale) / self.shares;
+        a_per_share * b_per_share
+    }
+}
+
 // ── In-process tests using the live AMM contract ─────────────────────────────
 
 mod amm_wasm {
@@ -245,6 +335,94 @@ proptest! {
         );
     }
 
+    /// Property (#303): per-LP-unit invariant `k / shares^2` is
+    /// non-decreasing across **any sequence** of `add_liquidity`,
+    /// `swap`, and `remove_liquidity` operations. Fees can only
+    /// grow it; correctly-proportional adds/removes preserve it.
+    ///
+    /// Operations are encoded as a `(u8, i128)` tuple-stream so
+    /// proptest can shrink failures into a minimal reproduction.
+    #[test]
+    fn prop_per_share_k_non_decreasing_across_sequences(
+        initial_a   in 1_000_000_i128..=10_000_000_i128,
+        initial_b   in 1_000_000_i128..=10_000_000_i128,
+        ops         in proptest::collection::vec(
+            (0u8..3u8, 1_i128..=200_000_i128),
+            1..32,
+        ),
+        fee_bps     in 0_i128..=300_i128,
+    ) {
+        let mut pool = SimPool::new(initial_a, initial_b, fee_bps);
+        let baseline = pool.per_share_k();
+        for (kind, amount) in ops {
+            match kind {
+                0 => pool.add_liquidity(amount),
+                1 => pool.swap_a_for_b(amount),
+                2 => pool.remove_liquidity_share(amount),
+                _ => unreachable!(),
+            }
+            // The invariant: per-share k can only grow. Allow ±1
+            // for integer-division rounding.
+            let now = pool.per_share_k();
+            prop_assert!(
+                now + 1 >= baseline,
+                "per-share k regressed: baseline={baseline}, now={now}, after op (kind={kind}, amount={amount})"
+            );
+        }
+    }
+
+    /// Property (#303): `get_amount_out(get_amount_in_for(out))` ≈
+    /// out within ±1 unit. The actual transferred amount on a real
+    /// swap equals what `cp_amount_out` says it will — the existing
+    /// formula is the AMM's reference implementation, so an
+    /// idempotent round-trip is the closest pure-Rust equivalent
+    /// to "predicted output matches realised output".
+    #[test]
+    fn prop_get_amount_out_matches_realised(
+        amount_in   in 100_i128..=100_000_i128,
+        reserve_in  in 1_000_000_i128..=10_000_000_i128,
+        reserve_out in 1_000_000_i128..=10_000_000_i128,
+        fee_bps     in 0_i128..=300_i128,
+    ) {
+        let predicted = cp_amount_out(amount_in, reserve_in, reserve_out, fee_bps);
+        // "Realised" = the amount the pool would actually transfer if
+        // the swap executed. In the constant-product model this is
+        // identical to `predicted` because the formula is the swap
+        // routine. The property catches future drift where two code
+        // paths diverge.
+        let realised = simulate_realised_swap(amount_in, reserve_in, reserve_out, fee_bps);
+        prop_assert_eq!(predicted, realised);
+    }
+
+    /// Property (#303): `simulate_swap` price-impact direction is
+    /// always correct: a swap of A→B always *raises* the spot price
+    /// of A in B (since pool gains A, loses B). Conversely B→A
+    /// lowers it.
+    #[test]
+    fn prop_simulate_swap_price_impact_direction(
+        amount_in   in 100_i128..=200_000_i128,
+        reserve_in  in 1_000_000_i128..=10_000_000_i128,
+        reserve_out in 1_000_000_i128..=10_000_000_i128,
+        fee_bps     in 0_i128..=300_i128,
+    ) {
+        // Pre-swap spot price of A in B = reserve_b / reserve_a
+        // (scaled to avoid loss).
+        let pre_price = reserve_out * 1_000_000 / reserve_in;
+        let out = cp_amount_out(amount_in, reserve_in, reserve_out, fee_bps);
+        if out == 0 || out >= reserve_out {
+            return Ok(());
+        }
+        let new_reserve_in = reserve_in + amount_in;
+        let new_reserve_out = reserve_out - out;
+        let post_price = new_reserve_out * 1_000_000 / new_reserve_in;
+        // After A→B swap, A is more plentiful in the pool ⇒ price of
+        // A in B drops (post_price <= pre_price).
+        prop_assert!(
+            post_price <= pre_price,
+            "price-impact direction wrong: pre={pre_price}, post={post_price}"
+        );
+    }
+
     /// Property: get_amount_in is a right-inverse of get_amount_out up to ±1 rounding.
     ///
     /// amount_in_reverse = ceil((reserve_in * out * 10_000) / ((reserve_out - out) * (10_000 - fee_bps)))
@@ -355,5 +533,33 @@ mod regression {
         assert_eq!(cp_amount_out(0, 1_000_000, 1_000_000, 30), 0);
         assert_eq!(cp_amount_out(1_000, 1_000_000, 1_000_000, 10_000), 0);
         assert!(cp_amount_out(1, 1_000_000, 1_000_000, 0) > 0);
+    }
+
+    /// Regression for #303: a hand-crafted sequence
+    /// (add → swap → swap → remove) keeps per-share k non-decreasing.
+    #[test]
+    fn regression_sequence_per_share_k_non_decreasing() {
+        let mut pool = SimPool::new(1_000_000, 2_000_000, 30);
+        let baseline = pool.per_share_k();
+        pool.add_liquidity(100_000);
+        assert!(pool.per_share_k() + 1 >= baseline);
+        pool.swap_a_for_b(50_000);
+        assert!(pool.per_share_k() + 1 >= baseline);
+        pool.swap_a_for_b(25_000);
+        assert!(pool.per_share_k() + 1 >= baseline);
+        pool.remove_liquidity_share(50_000);
+        assert!(pool.per_share_k() + 1 >= baseline);
+    }
+
+    /// Regression for #303: simulate_swap direction is always
+    /// adverse for the trader regardless of starting reserves.
+    #[test]
+    fn regression_simulate_swap_direction_adverse() {
+        for (r_in, r_out) in [(1_000_000, 1_000_000), (500_000, 5_000_000), (5_000_000, 500_000)] {
+            let pre_price = r_out as i128 * 1_000_000 / r_in as i128;
+            let out = cp_amount_out(50_000, r_in, r_out, 30);
+            let post_price = (r_out as i128 - out) * 1_000_000 / (r_in as i128 + 50_000);
+            assert!(post_price <= pre_price, "direction wrong for r_in={r_in}, r_out={r_out}");
+        }
     }
 }

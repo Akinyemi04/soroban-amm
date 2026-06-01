@@ -25,6 +25,8 @@ mod tests {
     use governance::{GovernanceClient, ProposalKind, Vote};
     use soroban_sdk::token::StellarAssetClient;
     use twap_consumer::{TwapConsumer, TwapConsumerClient};
+    use twal_consumer::{TwalConsumer, TwalConsumerClient};
+    use dex_aggregator::{DexAggregator, DexAggregatorClient};
 
     // Use a deadline far enough in the future for all test operations.
     const DEADLINE: u64 = u64::MAX;
@@ -382,6 +384,68 @@ mod tests {
             "tick 0 should be uninitialized after all positions burned"
         );
         assert_eq!(t0_cleaned.liquidity_gross, 0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Scenario: TWAL consumer + DEX aggregator (#261, #260)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn scenario_twal_and_aggregator() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash: BytesN<32> = env.deployer().upload_contract_wasm(AMM_WASM);
+        let token_hash: BytesN<32> = env.deployer().upload_contract_wasm(TOKEN_WASM);
+        let admin = Address::generate(&env);
+
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+
+        let token_a = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let token_b = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let token_c = env.register_stellar_asset_contract_v2(admin.clone()).address();
+
+        let (pool_ab, _) = factory.create_pool(&token_a, &token_b, &30_i128, &None);
+        let (pool_bc, _) = factory.create_pool(&token_b, &token_c, &30_i128, &None);
+
+        let provider = Address::generate(&env);
+        StellarAssetClient::new(&env, &token_a).mint(&provider, &2_000_000_i128);
+        StellarAssetClient::new(&env, &token_b).mint(&provider, &2_000_000_i128);
+        StellarAssetClient::new(&env, &token_c).mint(&provider, &1_000_000_i128);
+
+        set_ledger_ts(&env, 10_000);
+        AmmPoolClient::new(&env, &pool_ab).add_liquidity(
+            &provider,
+            &1_000_000_i128,
+            &1_000_000_i128,
+            &1_i128,
+            &DEADLINE,
+        );
+        AmmPoolClient::new(&env, &pool_bc).add_liquidity(
+            &provider,
+            &1_000_000_i128,
+            &1_000_000_i128,
+            &1_i128,
+            &DEADLINE,
+        );
+
+        let twal_addr = env.register_contract(None, TwalConsumer);
+        let twal = TwalConsumerClient::new(&env, &twal_addr);
+        twal.save_snapshot(&pool_ab);
+        set_ledger_ts(&env, 10_600);
+        twal.save_snapshot(&pool_ab);
+        let twal_val = twal.get_twal_liquidity(&pool_ab, &600);
+        assert!(twal_val > 0);
+
+        let agg_addr = env.register_contract(None, DexAggregator);
+        let agg = DexAggregatorClient::new(&env, &agg_addr);
+        agg.initialize(&factory_addr);
+        let quote = agg.find_best_route(&token_a, &token_c, &50_000_i128);
+        assert!(quote.amount_out > 0);
+        assert!(quote.hops.len() >= 2);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

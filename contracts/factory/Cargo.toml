@@ -12,6 +12,7 @@ testutils = ["soroban-sdk/testutils", "amm/testutils", "token/testutils", "conce
 
 [dependencies]
 soroban-sdk = { workspace = true }
+soroban-amm-sdk = { path = "../amm-sdk" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

@@ -1,0 +1,21 @@
+{
+  "name": "@soroban-amm/webhook-streamer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Push-based webhook service that subscribes to Soroban contract events via Horizon and fans them out to registered webhooks (issue #306).",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "test": "node --test dist/streamer.test.js"
+  },
+  "dependencies": {
+    "node-fetch": "3.3.2"
+  },
+  "devDependencies": {
+    "@types/node": "22.0.0",
+    "tsx": "4.19.0",
+    "typescript": "5.6.0"
+  }
+}

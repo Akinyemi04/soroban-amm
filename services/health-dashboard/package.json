@@ -1,0 +1,14 @@
+{
+  "name": "@soroban-amm/health-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Off-chain pool health monitoring dashboard for the Soroban AMM",
+  "scripts": {
+    "dev": "npx serve . -p 3000",
+    "build": "echo 'Static dashboard — no build step required'",
+    "lint": "echo 'No lint configured for static dashboard'"
+  },
+  "devDependencies": {
+    "serve": "^14.0.0"
+  }
+}

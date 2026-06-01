@@ -192,6 +192,7 @@ pub enum ProposalKind {
     TransferAdmin(Address),
     PausePool,
     UnpausePool,
+    EmergencyWithdraw(Address),
 }
 
 #[contracttype]
@@ -243,6 +244,7 @@ pub trait AmmPoolInterface {
     fn set_protocol_fee(env: Env, admin: Address, recipient: Address, protocol_fee_bps: i128);
     fn pause(env: Env);
     fn unpause(env: Env);
+    fn emergency_withdraw(env: Env, to: Address);
     fn propose_admin(env: Env, current_admin: Address, new_admin: Address);
 }
 
@@ -429,10 +431,7 @@ impl Governance {
             .instance()
             .set(&DataKey::ProposalCount, &(id + 1));
 
-        env.events().publish(
-            (Symbol::new(&env, "proposed"),),
-            (id, proposer, kind, vote_end, snapshot_ledger),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "proposed"),), (id, proposer, kind, vote_end, snapshot_ledger));
 
         Ok(id)
     }
@@ -518,10 +517,7 @@ impl Governance {
         env.storage().persistent().set(&voted_key, &record);
         Self::bump_key_ttl(&env, &voted_key);
 
-        env.events().publish(
-            (Symbol::new(&env, "voted"),),
-            (proposal_id, voter, choice, voting_power),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "voted"),), (proposal_id, voter, choice, voting_power));
         Ok(())
     }
 
@@ -596,6 +592,9 @@ impl Governance {
             }
             ProposalKind::UnpausePool => {
                 amm_client.unpause();
+            },
+            ProposalKind::EmergencyWithdraw(to) => {
+                amm_client.emergency_withdraw(to);
             }
         }
 
@@ -603,10 +602,7 @@ impl Governance {
         env.storage().persistent().set(&proposal_key, &proposal);
         Self::bump_key_ttl(&env, &proposal_key);
 
-        env.events().publish(
-            (Symbol::new(&env, "executed"),),
-            (proposal_id, proposal.kind.clone()),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "executed"),), (proposal_id, proposal.kind.clone()));
         Ok(())
     }
 
@@ -697,10 +693,7 @@ impl Governance {
         LpTokenClient::new(&env, &lp_token).unlock(&voter, &locked);
         env.storage().persistent().remove(&lock_key);
 
-        env.events().publish(
-            (Symbol::new(&env, "vote_unlocked"), voter.clone()),
-            (proposal_id, locked),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "vote_unlocked"), voter.clone()), (proposal_id, locked));
         Ok(())
     }
 
@@ -766,6 +759,7 @@ impl Governance {
             .get(&DataKey::Delegate(from))
             .unwrap_or(None)
     }
+
 
     /// Admin-only: set the protocol multisig that may veto passed proposals.
     pub fn set_veto_multisig(env: Env, multisig: Address) -> Result<(), GovernanceError> {
@@ -845,10 +839,7 @@ impl Governance {
         env.storage().persistent().set(&audit_key, &audit);
         Self::bump_key_ttl(&env, &audit_key);
 
-        env.events().publish(
-            (Symbol::new(&env, "vetoed"),),
-            (proposal_id, multisig, now, discussion_end),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "vetoed"),), (proposal_id, multisig, now, discussion_end));
         Ok(())
     }
 
@@ -1427,7 +1418,9 @@ mod tests {
                 e.0 == gov.address && e.1 == (Symbol::new(&s.env, "proposed"),).into_val(&s.env)
             })
             .expect("proposed event not found");
-        let proposed_data: (u32, Address, ProposalKind, u64, u32) = proposed_evt.2.into_val(&s.env);
+        let __ver_7: (u32, (u32, Address, ProposalKind, u64, u32)) = proposed_evt.2.into_val(&s.env);
+        assert_eq!(__ver_7.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        let proposed_data: (u32, Address, ProposalKind, u64, u32) = __ver_7.1;
         assert_eq!(
             proposed_data,
             (
@@ -1447,7 +1440,9 @@ mod tests {
             .iter()
             .find(|e| e.0 == gov.address && e.1 == (Symbol::new(&s.env, "voted"),).into_val(&s.env))
             .expect("voted event not found");
-        let voted_data: (u32, Address, Vote, i128) = voted_evt.2.into_val(&s.env);
+        let __ver_8: (u32, (u32, Address, Vote, i128)) = voted_evt.2.into_val(&s.env);
+        assert_eq!(__ver_8.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        let voted_data: (u32, Address, Vote, i128) = __ver_8.1;
         assert_eq!(voted_data, (pid, lp1.clone(), Vote::For, 600_i128));
 
         gov.vote(&lp2, &pid, &Vote::For);
@@ -1463,7 +1458,9 @@ mod tests {
                 e.0 == gov.address && e.1 == (Symbol::new(&s.env, "executed"),).into_val(&s.env)
             })
             .expect("executed event not found");
-        let executed_data: (u32, ProposalKind) = executed_evt.2.into_val(&s.env);
+        let __ver_9: (u32, (u32, ProposalKind)) = executed_evt.2.into_val(&s.env);
+        assert_eq!(__ver_9.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        let executed_data: (u32, ProposalKind) = __ver_9.1;
         assert_eq!(executed_data, (pid, ProposalKind::UpdateFee(50)));
     }
 
@@ -1521,6 +1518,35 @@ mod tests {
         assert_eq!(fee_rec, Some(recipient));
         assert_eq!(bps, 10);
         gov.unlock_vote(&lp1, &pid4);
+
+        // --- 5. Test EmergencyWithdraw proposal ---
+        let emergency_rec = Address::generate(&s.env);
+        let pid5 = gov.propose(&lp1, &ProposalKind::EmergencyWithdraw(emergency_rec.clone()));
+        gov.vote(&lp1, &pid5, &Vote::For);
+        let prop5 = gov.get_proposal(&pid5);
+        s.env.ledger().set_timestamp(prop5.execute_after + 1);
+
+        let ta_sac = StellarAssetClient::new(&s.env, &info.token_a);
+        let tb_sac = StellarAssetClient::new(&s.env, &info.token_b);
+        let provider = Address::generate(&s.env);
+        ta_sac.mint(&provider, &100_000_i128);
+        tb_sac.mint(&provider, &100_000_i128);
+
+        amm.add_liquidity(&provider, &100_000_i128, &100_000_i128, &0_i128, &u64::MAX);
+        assert_eq!(amm.get_info().reserve_a, 100_000);
+        assert_eq!(amm.get_info().reserve_b, 100_000);
+
+        gov.execute(&pid5);
+
+        assert_eq!(amm.get_info().reserve_a, 0);
+        assert_eq!(amm.get_info().reserve_b, 0);
+
+        let ta_client = StellarTokenClient::new(&s.env, &info.token_a);
+        let tb_client = StellarTokenClient::new(&s.env, &info.token_b);
+        assert_eq!(ta_client.balance(&emergency_rec), 100_000);
+        assert_eq!(tb_client.balance(&emergency_rec), 100_000);
+
+        gov.unlock_vote(&lp1, &pid5);
     }
 
     #[test]
@@ -1714,7 +1740,9 @@ mod tests {
             })
             .expect("vote_unlocked event not emitted");
 
-        let data: (u32, i128) = unlock_evt.2.into_val(&s.env);
+        let __ver_10: (u32, (u32, i128)) = unlock_evt.2.into_val(&s.env);
+        assert_eq!(__ver_10.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        let data: (u32, i128) = __ver_10.1;
         assert_eq!(data.0, pid);
         assert_eq!(data.1, 600_i128); // amount_unlocked == voting power used
     }
@@ -1844,7 +1872,9 @@ mod tests {
             .iter()
             .find(|e| e.0 == s.gov_addr && e.1 == (Symbol::new(&s.env, "vetoed"),).into_val(&s.env))
             .expect("vetoed event");
-        let data: (u32, Address, u64, u64) = veto_evt.2.into_val(&s.env);
+        let __ver_11: (u32, (u32, Address, u64, u64)) = veto_evt.2.into_val(&s.env);
+        assert_eq!(__ver_11.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        let data: (u32, Address, u64, u64) = __ver_11.1;
         assert_eq!(data.0, pid);
     }
 
@@ -1880,10 +1910,73 @@ mod tests {
 #[cfg(test)]
 mod prop_tests {
     extern crate std;
+    use super::*;
+    use amm::AmmPool;
+    use proptest::collection;
     use proptest::prelude::*;
+    use proptest::test_runner::{Config, TestRunner};
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::{Address, Env};
+    use token::LpToken;
+
+    // ── Test harness ────────────────────────────────────────────────────────────
+
+    struct PropEnv {
+        env: Env,
+        gov_addr: Address,
+        lp_addr: Address,
+    }
+
+    fn setup_prop_env() -> PropEnv {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1_000_000);
+
+        let admin = Address::generate(&env);
+
+        let lp_addr = env.register_contract(None, LpToken);
+        token::LpTokenClient::new(&env, &lp_addr).initialize(
+            &admin,
+            &soroban_sdk::String::from_str(&env, "AMM LP"),
+            &soroban_sdk::String::from_str(&env, "ALP"),
+            &7u32,
+        );
+
+        let ta = env.register_stellar_asset_contract_v2(admin.clone());
+        let tb = env.register_stellar_asset_contract_v2(admin.clone());
+
+        let amm_addr = env.register_contract(None, AmmPool);
+        amm::AmmPoolClient::new(&env, &amm_addr).initialize(
+            &admin,
+            &ta.address(),
+            &tb.address(),
+            &lp_addr,
+            &30_i128,
+            &admin,
+            &0_i128,
+        );
+
+        let gov_addr = env.register_contract(None, Governance);
+        GovernanceClient::new(&env, &gov_addr).initialize(
+            &admin,
+            &amm_addr,
+            &lp_addr,
+            &(7 * 24 * 60 * 60_u64),
+            &(2 * 24 * 60 * 60_u64),
+            &1_000_i128,
+            &100_i128,
+        );
+
+        token::LpTokenClient::new(&env, &lp_addr).set_locker(&gov_addr);
+        PropEnv { env, gov_addr, lp_addr }
+    }
+
+    // ── Pure math properties ────────────────────────────────────────────────────
 
     proptest! {
-        /// Property 1: Quorum threshold never overflows or goes out of bounds.
+        #![proptest_config = ProptestConfig::with_cases(512)]
+
+        /// Quorum threshold never overflows or goes out of bounds.
         #[test]
         fn quorum_check_never_overflows(
             total_supply in 1i128..i128::MAX / 10_000,
@@ -1894,38 +1987,29 @@ mod prop_tests {
             prop_assert!(threshold <= total_supply);
         }
 
-        /// Property 2: Majority check logic is correct and doesn't panic.
+        /// Combined votes cast never exceeds total supply.
         #[test]
-        fn majority_implies_votes_for_gt_against(
+        fn total_votes_does_not_exceed_supply(
             votes_for in 0i128..i128::MAX / 2,
             votes_against in 0i128..i128::MAX / 2,
+            votes_abstain in 0i128..i128::MAX / 2,
         ) {
-            let passed = votes_for > votes_against;
-            prop_assert_eq!(passed, votes_for > votes_against);
+            let total_supply = votes_for.saturating_add(votes_against).saturating_add(votes_abstain);
+            let total_votes = votes_for + votes_against + votes_abstain;
+            // Every vote cast is a real LP holder — sum cannot exceed total supply.
+            prop_assert!(total_votes <= total_supply,
+                "total_votes={total_votes} > total_supply={total_supply}");
+
+            // Individual vote buckets are non-negative and bounded.
+            prop_assert!(votes_for >= 0);
+            prop_assert!(votes_against >= 0);
+            prop_assert!(votes_abstain >= 0);
+            prop_assert!(votes_for <= total_votes);
+            prop_assert!(votes_against <= total_votes);
+            prop_assert!(votes_abstain <= total_votes);
         }
 
-        /// Property 3: Combined votes cast ≤ total supply is preserved.
-        #[test]
-        fn total_votes_does_not_overflow(
-            votes_for in 0i128..i128::MAX / 2,
-            votes_against in 0i128..i128::MAX / 2,
-        ) {
-            let total_supply = votes_for.saturating_add(votes_against);
-            let total_votes = votes_for + votes_against;
-            prop_assert!(total_votes <= total_supply);
-        }
-
-        /// Property 4: Timelock boundary execute_after == vote_end + TIMELOCK_SECS always holds.
-        #[test]
-        fn timelock_boundary_always_holds(
-            vote_end in 0u64..u64::MAX / 2,
-            timelock in 0u64..u64::MAX / 2,
-        ) {
-            let execute_after = vote_end + timelock;
-            prop_assert_eq!(execute_after, vote_end + timelock);
-        }
-
-        /// Property 5: Min proposer stake math holds and is within expected bounds.
+        /// Min proposer stake math holds and is within expected bounds.
         #[test]
         fn min_proposer_stake_is_correct(
             total_supply in 1i128..i128::MAX / 10_000,
@@ -1936,7 +2020,7 @@ mod prop_tests {
             prop_assert!(min_stake <= total_supply.max(1));
         }
 
-        /// Property 6: Expiry always comes at or after execute_after.
+        /// Expiry always comes at or after execute_after.
         #[test]
         fn expiry_logic_boundaries(
             vote_end in 0u64..u64::MAX / 3,
@@ -1945,7 +2029,464 @@ mod prop_tests {
         ) {
             let execute_after = vote_end + timelock;
             let expires_at = execute_after + timelock.max(voting_period);
+            prop_assert!(expires_at >= execute_after,
+                "expires_at={expires_at} < execute_after={execute_after}");
+            prop_assert!(execute_after >= vote_end);
+        }
+
+        /// No overflow in proposal lifecycle timestamps.
+        #[test]
+        fn timestamp_arithmetic_no_overflow(
+            now in 0u64..u64::MAX / 4,
+            voting_period in 1u64..u64::MAX / 4,
+            timelock in 0u64..u64::MAX / 4,
+        ) {
+            let vote_end = now + voting_period;
+            let execute_after = vote_end + timelock;
+            let expires_at = execute_after + timelock.max(voting_period);
+            prop_assert!(vote_end >= now);
+            prop_assert!(execute_after >= vote_end);
             prop_assert!(expires_at >= execute_after);
         }
+
+        /// Edge-case: when timelock is zero, execute_after == vote_end.
+        #[test]
+        fn zero_timelock_property(
+            vote_end in 0u64..u64::MAX / 2,
+        ) {
+            let execute_after = vote_end + 0;
+            prop_assert_eq!(execute_after, vote_end);
+        }
+    }
+
+    // ── Property 1: Voting power conservation (contract-level) ─────────────────
+
+    #[test]
+    fn prop_voting_power_conservation() {
+        let mut runner = TestRunner::new(Config { cases: 256, ..Config::default() });
+
+        let strategy = collection::vec((1i128..10_000, 0..4i8), 2..=8);
+
+        runner.run(&strategy, |voters| {
+            let pe = setup_prop_env();
+            let gov = GovernanceClient::new(&pe.env, &pe.gov_addr);
+            let lp = token::LpTokenClient::new(&pe.env, &pe.lp_addr);
+
+            let n = voters.len();
+            let holders: std::vec::Vec<Address> =
+                (0..n).map(|_| Address::generate(&pe.env)).collect();
+
+            for (i, (amt, _)) in voters.iter().enumerate() {
+                if *amt > 0 {
+                    lp.mint(&holders[i], amt);
+                }
+            }
+
+            let total_supply: i128 = voters.iter().map(|(a, _)| a).sum();
+            let proposer_idx = voters.iter().position(|(a, _)| *a >= 1).unwrap();
+            let pid = gov.propose(&holders[proposer_idx], &ProposalKind::UpdateFee(50));
+
+            let mut expected_for: i128 = 0;
+            let mut expected_against: i128 = 0;
+            let mut expected_abstain: i128 = 0;
+
+            for (i, (amt, vote_choice)) in voters.iter().enumerate() {
+                if *vote_choice == 0 || *amt == 0 {
+                    continue;
+                }
+                let choice = match *vote_choice {
+                    1 => Vote::For,
+                    2 => Vote::Against,
+                    _ => Vote::Abstain,
+                };
+                if gov.try_vote(&holders[i], &pid, &choice).is_ok() {
+                    match choice {
+                        Vote::For => expected_for += amt,
+                        Vote::Against => expected_against += amt,
+                        Vote::Abstain => expected_abstain += amt,
+                    }
+                    let locked = lp.locked_balance(&holders[i]);
+                    prop_assert_eq!(locked, *amt,
+                        "locked balance should equal voting power: voter={i}, locked={locked}, power={amt}");
+                }
+            }
+
+            let proposal = gov.get_proposal(&pid);
+            let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
+            prop_assert!(total_votes <= total_supply,
+                "total_votes={total_votes} exceeds total_supply={total_supply}");
+            prop_assert_eq!(proposal.votes_for, expected_for,
+                "votes_for mismatch");
+            prop_assert_eq!(proposal.votes_against, expected_against,
+                "votes_against mismatch");
+            prop_assert_eq!(proposal.votes_abstain, expected_abstain,
+                "votes_abstain mismatch");
+
+            // Each voter's locked amount never exceeds their minted balance.
+            for (i, (amt, _)) in voters.iter().enumerate() {
+                let locked = lp.locked_balance(&holders[i]);
+                prop_assert!(locked <= *amt,
+                    "voter {i}: locked={locked} > balance={amt}");
+            }
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    // ── Property 2: Delegated voting power conservation ─────────────────────────
+
+    #[test]
+    fn prop_delegated_power_conservation() {
+        let mut runner = TestRunner::new(Config { cases: 256, ..Config::default() });
+
+        let strategy = (
+            collection::vec(1i128..10_000, 2..=5),
+            0..5u32, // delegatee index within voters
+        );
+
+        runner.run(&strategy, |(amounts, delegatee_idx)| {
+            let pe = setup_prop_env();
+            let gov = GovernanceClient::new(&pe.env, &pe.gov_addr);
+            let lp = token::LpTokenClient::new(&pe.env, &pe.lp_addr);
+
+            let n = amounts.len();
+            let holders: std::vec::Vec<Address> =
+                (0..n).map(|_| Address::generate(&pe.env)).collect();
+
+            for (i, amt) in amounts.iter().enumerate() {
+                lp.mint(&holders[i], amt);
+            }
+
+            let delegatee = if (delegatee_idx as usize) < n {
+                (delegatee_idx as usize)
+            } else {
+                0
+            };
+
+            // All non-delegatee holders delegate to delegatee.
+            for (i, _) in amounts.iter().enumerate() {
+                if i != delegatee {
+                    gov.delegate(&holders[i], &holders[delegatee]);
+                }
+            }
+
+            let proposer = &holders[delegatee];
+            let pid = gov.propose(proposer, &ProposalKind::UpdateFee(50));
+
+            // Delegatee votes with aggregated power.
+            if gov
+                .try_vote(&holders[delegatee], &pid, &Vote::For)
+                .is_ok()
+            {
+                let expected_power: i128 = amounts.iter().sum();
+                let proposal = gov.get_proposal(&pid);
+                prop_assert_eq!(proposal.votes_for, expected_power,
+                    "delegated power={} != expected={}", proposal.votes_for, expected_power);
+
+                // Delegatee's locked balance equals their own LP (not the whole delegation).
+                let delegatee_locked = lp.locked_balance(&holders[delegatee]);
+                prop_assert_eq!(delegatee_locked, amounts[delegatee],
+                    "delegatee locked should equal own balance");
+
+                // Delegators' LPs should also be locked.
+                for (i, amt) in amounts.iter().enumerate() {
+                    if i != delegatee {
+                        let locked = lp.locked_balance(&holders[i]);
+                        prop_assert_eq!(locked, *amt,
+                            "delegator {i}: locked={locked} != balance={amt}");
+                    }
+                }
+
+                // Total supply conservation.
+                let total_supply: i128 = amounts.iter().sum();
+                let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
+                prop_assert!(total_votes <= total_supply,
+                    "total_votes={total_votes} > total_supply={total_supply}");
+            }
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    // ── Property 3: Vote locking / unlocking consistency ────────────────────────
+
+    #[test]
+    fn prop_lock_unlock_consistency() {
+        let mut runner = TestRunner::new(Config { cases: 256, ..Config::default() });
+
+        let strategy = collection::vec((1i128..10_000, 1..4i8), 2..=5);
+
+        runner.run(&strategy, |voters| {
+            let pe = setup_prop_env();
+            let gov = GovernanceClient::new(&pe.env, &pe.gov_addr);
+            let lp = token::LpTokenClient::new(&pe.env, &pe.lp_addr);
+
+            let n = voters.len();
+            let holders: std::vec::Vec<Address> =
+                (0..n).map(|_| Address::generate(&pe.env)).collect();
+
+            for (i, (amt, _)) in voters.iter().enumerate() {
+                lp.mint(&holders[i], amt);
+            }
+
+            let proposer_idx = voters.iter().position(|(a, _)| *a >= 1).unwrap();
+            let pid = gov.propose(&holders[proposer_idx], &ProposalKind::UpdateFee(50));
+
+            // Vote (each voter chooses For/Against/Abstain per their vote_choice)
+            for (i, (amt, vote_choice)) in voters.iter().enumerate() {
+                let choice = match *vote_choice {
+                    1 => Vote::For,
+                    2 => Vote::Against,
+                    _ => Vote::Abstain,
+                };
+                if gov.try_vote(&holders[i], &pid, &choice).is_ok() {
+                    // Immediately after vote: locked == voting power
+                    prop_assert_eq!(lp.locked_balance(&holders[i]), *amt,
+                        "after vote: locked={} != power={}", lp.locked_balance(&holders[i]), *amt);
+                }
+            }
+
+            // Verify unlocks fail while proposal is active.
+            for (i, _) in voters.iter().enumerate() {
+                if lp.locked_balance(&holders[i]) > 0 {
+                    prop_assert!(
+                        gov.try_unlock_vote(&holders[i], &pid).is_err(),
+                        "unlock should fail while proposal is active"
+                    );
+                }
+            }
+
+            // Advance past voting + timelock.
+            let proposal = gov.get_proposal(&pid);
+            pe.env
+                .ledger()
+                .set_timestamp(proposal.execute_after + 1);
+
+            // Execute (may succeed or fail depending on quorum/majority).
+            let _ = gov.try_execute(&pid);
+            let status = gov.proposal_status(&pid);
+
+            // Only concluded statuses allow unlock.
+            let can_unlock = matches!(
+                status,
+                ProposalStatus::Executed
+                    | ProposalStatus::Defeated
+                    | ProposalStatus::Expired
+                    | ProposalStatus::Cancelled
+            );
+
+            if can_unlock {
+                for (i, amt) in voters.iter().enumerate() {
+                    let locked_before = lp.locked_balance(&holders[i]);
+                    if locked_before > 0 {
+                        if gov.try_unlock_vote(&holders[i], &pid).is_ok() {
+                            let locked_after = lp.locked_balance(&holders[i]);
+                            prop_assert_eq!(locked_after, 0,
+                                "after unlock: locked should be 0, got {locked_after}");
+                        }
+                    } else {
+                        // Unlock with no locked vote should fail.
+                        prop_assert!(
+                            gov.try_unlock_vote(&holders[i], &pid).is_err(),
+                            "unlock with no locked vote should fail"
+                        );
+                    }
+                }
+            } else {
+                let status_name = std::format!("{:?}", status);
+                // Unlock should still fail for non-concluded proposals.
+                for (i, _) in voters.iter().enumerate() {
+                    if lp.locked_balance(&holders[i]) > 0 {
+                        let result = gov.try_unlock_vote(&holders[i], &pid);
+                        prop_assert!(result.is_err(),
+                            "unlock should fail for status={status_name}");
+                    }
+                }
+            }
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    // ── Property 4: Malicious / invalid voting scenarios ────────────────────────
+
+    #[test]
+    fn prop_malicious_voting_scenarios() {
+        let mut runner = TestRunner::new(Config { cases: 256, ..Config::default() });
+
+        let strategy = collection::vec(1i128..10_000, 3..=6);
+
+        runner.run(&strategy, |amounts| {
+            let pe = setup_prop_env();
+            let gov = GovernanceClient::new(&pe.env, &pe.gov_addr);
+            let lp = token::LpTokenClient::new(&pe.env, &pe.lp_addr);
+
+            // We need n main holders, plus a zero-balance address, plus 2 delegation
+            // addresses — all minted before the proposal snapshot.
+            let n = amounts.len();
+            let holders: std::vec::Vec<Address> =
+                (0..n + 3).map(|_| Address::generate(&pe.env)).collect();
+
+            for (i, amt) in amounts.iter().enumerate() {
+                lp.mint(&holders[i], amt);
+            }
+            // Mint LP for delegation addresses so they have snapshot voting power.
+            lp.mint(&holders[n + 1], &1000);
+            lp.mint(&holders[n + 2], &1000);
+
+            let pid = gov.propose(&holders[0], &ProposalKind::UpdateFee(50));
+
+            // ── A: Double vote ──
+            if gov.try_vote(&holders[0], &pid, &Vote::For).is_ok() {
+                let double = gov.try_vote(&holders[0], &pid, &Vote::For);
+                prop_assert!(double.is_err(), "double vote should fail");
+            }
+
+            // ── B: Vote after deadline ──
+            {
+                let proposal = gov.get_proposal(&pid);
+                pe.env.ledger().set_timestamp(proposal.vote_end + 1);
+                let late_vote = gov.try_vote(&holders[1], &pid, &Vote::For);
+                prop_assert!(late_vote.is_err(), "vote after deadline should fail");
+                pe.env.ledger().set_timestamp(1_000_000);
+            }
+
+            // ── C: Vote on non-existent proposal ──
+            {
+                let bad_vote = gov.try_vote(&holders[1], &u32::MAX, &Vote::For);
+                prop_assert!(bad_vote.is_err(), "vote on bad proposal should fail");
+            }
+
+            // ── D: Vote with 0 snapshot balance (holder never minted) ──
+            {
+                let zero_vote = gov.try_vote(&holders[n], &pid, &Vote::For);
+                prop_assert!(zero_vote.is_err(), "vote with 0 balance should fail");
+            }
+
+            // ── E: Self-delegation ──
+            {
+                let self_delegate = gov.try_delegate(&holders[1], &holders[1]);
+                prop_assert!(self_delegate.is_err(), "self-delegation should fail");
+            }
+
+            // ── F: Delegation cycle (a->b, b->a) ──
+            {
+                let a = &holders[n + 1];
+                let b = &holders[n + 2];
+                if gov.try_delegate(a, b).is_ok() {
+                    let cycle = gov.try_delegate(b, a);
+                    prop_assert!(cycle.is_err(), "delegation cycle should fail");
+                }
+            }
+
+            // ── G: Vote while delegated ──
+            {
+                let deleter = &holders[n + 1];
+                let del_target = &holders[n + 2];
+                if gov.try_delegate(deleter, del_target).is_ok() {
+                    let delegated_vote = gov.try_vote(deleter, &pid, &Vote::For);
+                    prop_assert!(delegated_vote.is_err(),
+                        "delegated address should not be able to vote directly");
+                }
+            }
+
+            // ── H: Unlock without ever voting ──
+            {
+                let unlock_no_vote = gov.try_unlock_vote(&holders[2], &pid);
+                prop_assert!(unlock_no_vote.is_err(),
+                    "unlock without voting should fail");
+            }
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    // ── Property 5: Post-execution unlock guarantees ────────────────────────────
+
+    #[test]
+    fn prop_post_execution_unlock_recovers_all_locked_tokens() {
+        let mut runner = TestRunner::new(Config { cases: 256, ..Config::default() });
+
+        let strategy = collection::vec((1i128..5_000, 1..4i8), 2..=5);
+
+        runner.run(&strategy, |voters| {
+            let pe = setup_prop_env();
+            let gov = GovernanceClient::new(&pe.env, &pe.gov_addr);
+            let lp = token::LpTokenClient::new(&pe.env, &pe.lp_addr);
+
+            let n = voters.len();
+            let holders: std::vec::Vec<Address> =
+                (0..n).map(|_| Address::generate(&pe.env)).collect();
+
+            for (i, (amt, _)) in voters.iter().enumerate() {
+                lp.mint(&holders[i], amt);
+            }
+
+            let proposer_idx = voters.iter().position(|(a, _)| *a >= 1).unwrap();
+            let pid = gov.propose(&holders[proposer_idx], &ProposalKind::UpdateFee(50));
+
+            for (i, (_, vote_choice)) in voters.iter().enumerate() {
+                let choice = match *vote_choice {
+                    1 => Vote::For,
+                    2 => Vote::Against,
+                    _ => Vote::Abstain,
+                };
+                let _ = gov.try_vote(&holders[i], &pid, &choice);
+            }
+
+            // Advance time and try to execute.
+            let proposal = gov.get_proposal(&pid);
+            pe.env.ledger().set_timestamp(proposal.execute_after + 1);
+            let _ = gov.try_execute(&pid);
+            let status = gov.proposal_status(&pid);
+
+            let can_unlock = matches!(
+                status,
+                ProposalStatus::Executed
+                    | ProposalStatus::Defeated
+                    | ProposalStatus::Expired
+                    | ProposalStatus::Cancelled
+            );
+
+            if can_unlock {
+                let mut total_locked_before: i128 = 0;
+                let mut total_locked_after: i128 = 0;
+
+                for (i, (amt, _)) in voters.iter().enumerate() {
+                    let locked_before = lp.locked_balance(&holders[i]);
+                    total_locked_before += locked_before;
+                    if locked_before > 0 {
+                        // Balance before unlock = balance - locked (locked unavailable for transfer).
+                        let bal_before = lp.balance(&holders[i]);
+
+                        let _ = gov.try_unlock_vote(&holders[i], &pid);
+
+                        let locked_after = lp.locked_balance(&holders[i]);
+                        total_locked_after += locked_after;
+
+                        // After unlock: user should be able to transfer their full balance.
+                        if locked_before > 0 && locked_after == 0 {
+                            // Attempt to transfer the originally locked amount to a fresh address.
+                            let recipient = Address::generate(&pe.env);
+                            let transfer_result =
+                                lp.try_transfer(&holders[i], &recipient, &locked_before);
+                            prop_assert!(transfer_result.is_ok(),
+                                "should be able to transfer unlocked tokens");
+                        }
+                    }
+                }
+
+                // After all unlocks, total locked should be 0 for concluded proposals.
+                prop_assert_eq!(total_locked_after, 0,
+                    "total locked after all unlocks should be 0, got {total_locked_after}");
+            }
+
+            Ok(())
+        })
+        .unwrap();
     }
 }

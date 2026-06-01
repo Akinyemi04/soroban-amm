@@ -1,0 +1,1054 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Soroban AMM Decentralized Governance Forum — create proposals, vote, delegate voting power, and track protocol decisions." />
+  <title>Soroban AMM · Governance</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    /* ── Reset & Tokens ────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0b0f1a;
+      --surface:   #111827;
+      --card:      #161d2f;
+      --border:    rgba(255,255,255,.08);
+      --accent:    #6c63ff;
+      --accent2:   #00d4aa;
+      --danger:    #f04e4e;
+      --warn:      #f4a93b;
+      --text:      #e2e8f0;
+      --muted:     #64748b;
+      --radius:    12px;
+      --shadow:    0 4px 24px rgba(0,0,0,.4);
+    }
+
+    body {
+      font-family: 'Inter', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      line-height: 1.6;
+    }
+
+    a { color: var(--accent); text-decoration: none; }
+    button { cursor: pointer; font-family: inherit; }
+
+    /* ── Layout ────────────────────────────────────────────────────── */
+    header {
+      position: sticky; top: 0; z-index: 100;
+      background: rgba(11,15,26,.85);
+      backdrop-filter: blur(16px);
+      border-bottom: 1px solid var(--border);
+      padding: 0 1.5rem;
+      display: flex; align-items: center; justify-content: space-between;
+      height: 64px;
+    }
+
+    .logo {
+      display: flex; align-items: center; gap: .6rem;
+      font-weight: 700; font-size: 1.1rem;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    }
+
+    .logo svg { flex-shrink: 0; }
+
+    .header-right { display: flex; align-items: center; gap: .75rem; }
+
+    .btn {
+      display: inline-flex; align-items: center; gap: .4rem;
+      padding: .5rem 1.1rem; border-radius: 8px; font-size: .875rem;
+      font-weight: 500; border: none; transition: all .2s;
+    }
+    .btn-primary  { background: var(--accent); color: #fff; }
+    .btn-primary:hover { background: #5a52e0; transform: translateY(-1px); box-shadow: 0 4px 16px rgba(108,99,255,.4); }
+    .btn-ghost    { background: transparent; color: var(--text); border: 1px solid var(--border); }
+    .btn-ghost:hover { background: var(--card); }
+    .btn-success  { background: var(--accent2); color: #0b0f1a; }
+    .btn-success:hover { filter: brightness(1.1); }
+    .btn-danger   { background: var(--danger); color: #fff; }
+    .btn-danger:hover { filter: brightness(1.1); }
+    .btn-sm { padding: .3rem .7rem; font-size: .8rem; }
+
+    .wallet-pill {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 20px; padding: .3rem .8rem;
+      font-size: .8rem; color: var(--muted);
+      display: flex; align-items: center; gap: .4rem;
+    }
+    .wallet-pill .dot { width:8px;height:8px;border-radius:50%;background:var(--accent2); animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1}50%{opacity:.4} }
+
+    main { max-width: 1180px; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+
+    /* ── Tabs ──────────────────────────────────────────────────────── */
+    .tabs { display:flex; gap:.25rem; background:var(--surface); border-radius:10px; padding:.25rem; margin-bottom:2rem; width:fit-content; flex-wrap:wrap; }
+    .tab { padding:.45rem 1rem; border-radius:7px; border:none; background:transparent; color:var(--muted); font-size:.875rem; font-weight:500; transition:all .2s; }
+    .tab.active { background:var(--accent); color:#fff; }
+    .tab:hover:not(.active) { color:var(--text); background:var(--card); }
+
+    /* ── Page sections ─────────────────────────────────────────────── */
+    .section { display:none; }
+    .section.visible { display:block; animation: fadeIn .3s ease; }
+    @keyframes fadeIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:none} }
+
+    /* ── Stats row ─────────────────────────────────────────────────── */
+    .stats-row { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:1rem; margin-bottom:2rem; }
+    .stat-card {
+      background:var(--card); border:1px solid var(--border); border-radius:var(--radius);
+      padding:1.25rem 1.5rem;
+      position:relative; overflow:hidden;
+    }
+    .stat-card::before {
+      content:''; position:absolute; inset:0;
+      background:linear-gradient(135deg,rgba(108,99,255,.06),transparent);
+    }
+    .stat-label { font-size:.75rem; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; margin-bottom:.4rem; }
+    .stat-val { font-size:1.6rem; font-weight:700; }
+    .stat-sub { font-size:.75rem; color:var(--muted); margin-top:.2rem; }
+
+    /* ── Proposal cards ────────────────────────────────────────────── */
+    .proposal-list { display:flex; flex-direction:column; gap:1rem; }
+
+    .proposal-card {
+      background:var(--card); border:1px solid var(--border);
+      border-radius:var(--radius); padding:1.4rem 1.6rem;
+      transition:border-color .2s, transform .2s, box-shadow .2s;
+      cursor:pointer; position:relative; overflow:hidden;
+    }
+    .proposal-card:hover { border-color:rgba(108,99,255,.4); transform:translateY(-2px); box-shadow:var(--shadow); }
+    .proposal-card::before {
+      content:''; position:absolute; left:0;top:0;bottom:0;width:3px;
+      background:linear-gradient(to bottom, var(--accent), var(--accent2));
+      border-radius:3px 0 0 3px;
+    }
+
+    .proposal-meta { display:flex; align-items:center; gap:.6rem; flex-wrap:wrap; margin-bottom:.6rem; }
+    .badge {
+      font-size:.7rem; font-weight:600; padding:.2rem .6rem; border-radius:20px;
+      text-transform:uppercase; letter-spacing:.05em;
+    }
+    .badge-active  { background:rgba(0,212,170,.15); color:var(--accent2); }
+    .badge-passed  { background:rgba(108,99,255,.15); color:var(--accent); }
+    .badge-failed  { background:rgba(240,78,78,.15);  color:var(--danger); }
+    .badge-pending { background:rgba(244,169,59,.15); color:var(--warn); }
+    .badge-cat     { background:rgba(255,255,255,.06); color:var(--muted); }
+
+    .proposal-id { font-size:.75rem; color:var(--muted); }
+    .proposal-title { font-size:1.05rem; font-weight:600; margin-bottom:.4rem; }
+    .proposal-desc  { font-size:.875rem; color:var(--muted); margin-bottom:1rem; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+
+    .vote-bar-wrap { margin-bottom:.6rem; }
+    .vote-bar-labels { display:flex; justify-content:space-between; font-size:.75rem; margin-bottom:.3rem; }
+    .vote-bar { height:6px; border-radius:3px; background:rgba(255,255,255,.08); position:relative; overflow:hidden; }
+    .vote-bar-fill { height:100%; border-radius:3px; background:linear-gradient(90deg,var(--accent2),var(--accent)); transition:width .6s cubic-bezier(.4,0,.2,1); }
+    .vote-bar-against { position:absolute; right:0; top:0; height:100%; background:var(--danger); border-radius:3px; }
+
+    .proposal-footer { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:.5rem; font-size:.8rem; color:var(--muted); margin-top:.8rem; }
+
+    .vote-actions { display:flex; gap:.5rem; }
+
+    /* ── Detail panel / Modal ──────────────────────────────────────── */
+    .overlay {
+      display:none; position:fixed; inset:0; background:rgba(0,0,0,.7);
+      backdrop-filter:blur(4px); z-index:200; align-items:center; justify-content:center; padding:1rem;
+    }
+    .overlay.open { display:flex; animation:fadeIn .2s ease; }
+
+    .modal {
+      background:var(--surface); border:1px solid var(--border); border-radius:16px;
+      max-width:700px; width:100%; max-height:90vh; overflow-y:auto;
+      padding:2rem; box-shadow:var(--shadow);
+    }
+
+    .modal-header { display:flex; align-items:flex-start; justify-content:space-between; gap:1rem; margin-bottom:1.5rem; }
+    .modal-close { background:none; border:none; color:var(--muted); font-size:1.5rem; line-height:1; padding:.2rem; }
+    .modal-close:hover { color:var(--text); }
+
+    .modal-section { margin-bottom:1.5rem; }
+    .modal-section h4 { font-size:.8rem; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin-bottom:.75rem; }
+
+    /* ── Wizard ────────────────────────────────────────────────────── */
+    .wizard-steps { display:flex; gap:0; margin-bottom:2rem; counter-reset:step; }
+    .wstep {
+      flex:1; display:flex; flex-direction:column; align-items:center; gap:.3rem;
+      font-size:.75rem; color:var(--muted); position:relative;
+    }
+    .wstep::after {
+      content:''; position:absolute; top:18px; left:50%; width:100%; height:2px;
+      background:var(--border);
+    }
+    .wstep:last-child::after { display:none; }
+    .wstep-dot {
+      width:36px;height:36px;border-radius:50%; background:var(--card); border:2px solid var(--border);
+      display:flex;align-items:center;justify-content:center; font-weight:600; font-size:.85rem; z-index:1;
+      transition:all .3s;
+    }
+    .wstep.done  .wstep-dot { background:var(--accent2); border-color:var(--accent2); color:#0b0f1a; }
+    .wstep.active .wstep-dot { background:var(--accent); border-color:var(--accent); color:#fff; }
+
+    .wizard-panel { display:none; }
+    .wizard-panel.active { display:block; animation:fadeIn .25s ease; }
+
+    .form-group { margin-bottom:1.25rem; }
+    .form-label { display:block; font-size:.85rem; font-weight:500; margin-bottom:.4rem; }
+    .form-label span { color:var(--muted); font-weight:400; }
+    .form-input, .form-select, .form-textarea {
+      width:100%; background:var(--card); border:1px solid var(--border);
+      border-radius:8px; color:var(--text); font-family:inherit; font-size:.9rem;
+      padding:.65rem .9rem; transition:border-color .2s;
+    }
+    .form-input:focus, .form-select:focus, .form-textarea:focus {
+      outline:none; border-color:var(--accent);
+    }
+    .form-textarea { resize:vertical; min-height:110px; }
+    .form-select { appearance:none; background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%2364748b' viewBox='0 0 16 16'%3E%3Cpath d='M7.247 11.14 2.451 5.658C1.885 5.013 2.345 4 3.204 4h9.592a1 1 0 0 1 .753 1.659l-4.796 5.48a1 1 0 0 1-1.506 0z'/%3E%3C/svg%3E"); background-repeat:no-repeat; background-position:right .9rem center; }
+    .char-count { font-size:.75rem; color:var(--muted); text-align:right; margin-top:.25rem; }
+    .helper { font-size:.78rem; color:var(--muted); margin-top:.25rem; }
+
+    .wizard-nav { display:flex; justify-content:space-between; margin-top:2rem; }
+
+    /* ── Power Calculator ──────────────────────────────────────────── */
+    .calc-grid { display:grid; grid-template-columns:1fr 1fr; gap:1.5rem; }
+    @media(max-width:600px){ .calc-grid{grid-template-columns:1fr;} }
+
+    .power-display {
+      background:var(--card); border:1px solid var(--border); border-radius:var(--radius);
+      padding:1.5rem; display:flex; flex-direction:column; align-items:center; gap:.5rem; text-align:center;
+    }
+    .power-ring {
+      width:120px; height:120px; position:relative; margin-bottom:.5rem;
+    }
+    .power-ring svg { width:100%; height:100%; transform:rotate(-90deg); }
+    .power-ring-val {
+      position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+      flex-direction:column;
+    }
+    .power-ring-num { font-size:1.5rem; font-weight:700; }
+    .power-ring-lbl { font-size:.7rem; color:var(--muted); }
+
+    .range-input { width:100%; accent-color:var(--accent); }
+    .range-row { display:flex; justify-content:space-between; font-size:.8rem; color:var(--muted); }
+
+    /* ── Delegation ────────────────────────────────────────────────── */
+    .delegate-card {
+      background:var(--card); border:1px solid var(--border); border-radius:var(--radius);
+      padding:1.25rem; display:flex; align-items:center; gap:1rem; margin-bottom:.75rem;
+      transition:border-color .2s;
+    }
+    .delegate-card:hover { border-color:rgba(108,99,255,.3); }
+    .avatar { width:42px;height:42px;border-radius:50%;object-fit:cover;flex-shrink:0; background:linear-gradient(135deg,var(--accent),var(--accent2)); display:flex;align-items:center;justify-content:center;font-weight:700;color:#fff;font-size:.9rem; }
+    .delegate-info { flex:1; }
+    .delegate-name { font-weight:600; font-size:.95rem; }
+    .delegate-meta { font-size:.78rem; color:var(--muted); }
+    .delegate-power { font-size:.85rem; font-weight:600; color:var(--accent2); white-space:nowrap; }
+
+    /* ── Analytics ─────────────────────────────────────────────────── */
+    .analytics-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:1.25rem; margin-bottom:1.5rem; }
+    .chart-card { background:var(--card); border:1px solid var(--border); border-radius:var(--radius); padding:1.25rem; }
+    .chart-card h4 { font-size:.8rem; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin-bottom:1rem; }
+
+    canvas { width:100%!important; }
+
+    /* mini bar chart */
+    .mini-bars { display:flex; align-items:flex-end; gap:4px; height:80px; }
+    .mini-bar {
+      flex:1; border-radius:3px 3px 0 0;
+      background:linear-gradient(to top,var(--accent),var(--accent2));
+      transition:height .4s ease; min-width:8px;
+    }
+    .mini-bar-label { font-size:.65rem; color:var(--muted); text-align:center; margin-top:.3rem; }
+
+    /* ── Toast ─────────────────────────────────────────────────────── */
+    #toasts { position:fixed; bottom:1.5rem; right:1.5rem; display:flex; flex-direction:column; gap:.5rem; z-index:999; }
+    .toast {
+      background:var(--surface); border:1px solid var(--border); border-radius:10px;
+      padding:.75rem 1.1rem; font-size:.875rem; box-shadow:var(--shadow);
+      display:flex; align-items:center; gap:.5rem;
+      animation: slideIn .3s ease; max-width:320px;
+    }
+    @keyframes slideIn { from{opacity:0;transform:translateX(20px)} to{opacity:1;transform:none} }
+    .toast-success { border-left:3px solid var(--accent2); }
+    .toast-error   { border-left:3px solid var(--danger); }
+
+    /* ── Responsive ────────────────────────────────────────────────── */
+    @media(max-width:640px){
+      header { padding:0 1rem; }
+      .logo span { display:none; }
+      main { padding:1.25rem .75rem 3rem; }
+      .tabs { width:100%; }
+      .tab { flex:1; text-align:center; padding:.4rem .5rem; font-size:.8rem; }
+      .proposal-card { padding:1rem 1.1rem; }
+      .vote-actions .btn { padding:.3rem .55rem; font-size:.75rem; }
+      .modal { padding:1.25rem; }
+    }
+
+    /* ── Accessibility focus rings ──────────────────────────────────── */
+    :focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+    .sr-only { position:absolute; width:1px;height:1px;padding:0;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0; }
+  </style>
+</head>
+<body>
+
+<!-- ═══════════════════════════════ HEADER ════════════════════════════════ -->
+<header role="banner">
+  <div class="logo" aria-label="Soroban AMM Governance">
+    <svg width="28" height="28" viewBox="0 0 28 28" fill="none" aria-hidden="true">
+      <circle cx="14" cy="14" r="13" stroke="url(#g1)" stroke-width="2"/>
+      <path d="M8 14 L14 8 L20 14 L14 20 Z" fill="url(#g2)" opacity=".9"/>
+      <defs>
+        <linearGradient id="g1" x1="0" y1="0" x2="28" y2="28"><stop stop-color="#6c63ff"/><stop offset="1" stop-color="#00d4aa"/></linearGradient>
+        <linearGradient id="g2" x1="8" y1="8" x2="20" y2="20"><stop stop-color="#6c63ff"/><stop offset="1" stop-color="#00d4aa"/></linearGradient>
+      </defs>
+    </svg>
+    <span>Soroban AMM · Governance</span>
+  </div>
+  <div class="header-right">
+    <div class="wallet-pill" aria-label="Read-only mode, no wallet required">
+      <span class="dot" aria-hidden="true"></span>Read-only mode
+    </div>
+    <button class="btn btn-primary btn-sm" id="connectWalletBtn" aria-label="Connect wallet">Connect Wallet</button>
+  </div>
+</header>
+
+<!-- ═══════════════════════════════ MAIN ═════════════════════════════════ -->
+<main role="main" id="main-content">
+
+  <!-- Stats -->
+  <div class="stats-row" role="region" aria-label="Governance statistics">
+    <div class="stat-card">
+      <div class="stat-label">Active Proposals</div>
+      <div class="stat-val" id="stat-active">4</div>
+      <div class="stat-sub">2 ending this week</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Total Votes Cast</div>
+      <div class="stat-val" id="stat-votes">18.4M</div>
+      <div class="stat-sub">↑ 12% this month</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Quorum Threshold</div>
+      <div class="stat-val">10%</div>
+      <div class="stat-sub">of circulating supply</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Your Voting Power</div>
+      <div class="stat-val" id="stat-power">—</div>
+      <div class="stat-sub">Connect wallet to view</div>
+    </div>
+  </div>
+
+  <!-- Tabs -->
+  <nav role="navigation" aria-label="Governance sections">
+    <div class="tabs" role="tablist" id="tablist">
+      <button class="tab active" role="tab" aria-selected="true"  aria-controls="sec-proposals"  id="tab-proposals"  data-tab="proposals">Proposals</button>
+      <button class="tab"        role="tab" aria-selected="false" aria-controls="sec-create"     id="tab-create"     data-tab="create">+ New Proposal</button>
+      <button class="tab"        role="tab" aria-selected="false" aria-controls="sec-delegate"   id="tab-delegate"   data-tab="delegate">Delegation</button>
+      <button class="tab"        role="tab" aria-selected="false" aria-controls="sec-calculator" id="tab-calculator" data-tab="calculator">Power Calc</button>
+      <button class="tab"        role="tab" aria-selected="false" aria-controls="sec-analytics"  id="tab-analytics"  data-tab="analytics">Analytics</button>
+    </div>
+  </nav>
+
+  <!-- ─── PROPOSALS ─────────────────────────────────────────────── -->
+  <section class="section visible" id="sec-proposals" role="tabpanel" aria-labelledby="tab-proposals">
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.75rem;margin-bottom:1.25rem;">
+      <h1 style="font-size:1.25rem;font-weight:700;">Governance Proposals</h1>
+      <div style="display:flex;gap:.5rem;flex-wrap:wrap;">
+        <select class="form-select" id="filterStatus" style="width:auto;font-size:.82rem;" aria-label="Filter by status">
+          <option value="">All Status</option>
+          <option value="active">Active</option>
+          <option value="passed">Passed</option>
+          <option value="failed">Failed</option>
+          <option value="pending">Pending</option>
+        </select>
+        <select class="form-select" id="filterCat" style="width:auto;font-size:.82rem;" aria-label="Filter by category">
+          <option value="">All Categories</option>
+          <option value="protocol">Protocol</option>
+          <option value="treasury">Treasury</option>
+          <option value="params">Parameters</option>
+        </select>
+      </div>
+    </div>
+    <div class="proposal-list" id="proposalList" role="list" aria-label="Proposals list"></div>
+  </section>
+
+  <!-- ─── CREATE PROPOSAL WIZARD ───────────────────────────────── -->
+  <section class="section" id="sec-create" role="tabpanel" aria-labelledby="tab-create">
+    <h2 style="font-size:1.2rem;font-weight:700;margin-bottom:1.5rem;">New Proposal Wizard</h2>
+
+    <div class="wizard-steps" role="list" aria-label="Wizard steps" id="wizardSteps">
+      <div class="wstep active" role="listitem" id="ws0"><div class="wstep-dot" aria-current="step">1</div><span>Details</span></div>
+      <div class="wstep"       role="listitem" id="ws1"><div class="wstep-dot">2</div><span>Parameters</span></div>
+      <div class="wstep"       role="listitem" id="ws2"><div class="wstep-dot">3</div><span>Actions</span></div>
+      <div class="wstep"       role="listitem" id="ws3"><div class="wstep-dot">4</div><span>Review</span></div>
+    </div>
+
+    <!-- Step 0: Details -->
+    <div class="wizard-panel active" id="wp0">
+      <div class="form-group">
+        <label class="form-label" for="propTitle">Title <span>*</span></label>
+        <input class="form-input" id="propTitle" type="text" maxlength="100" placeholder="Concise proposal title" aria-required="true" />
+        <div class="char-count"><span id="titleCount">0</span>/100</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="propCategory">Category <span>*</span></label>
+        <select class="form-select" id="propCategory" aria-required="true">
+          <option value="">Select category…</option>
+          <option value="protocol">Protocol Upgrade</option>
+          <option value="treasury">Treasury</option>
+          <option value="params">Parameter Change</option>
+          <option value="meta">Meta-Governance</option>
+          <option value="other">Other</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="propSummary">Summary <span>*</span></label>
+        <textarea class="form-textarea" id="propSummary" maxlength="500" placeholder="Brief description visible in the proposal list…" aria-required="true"></textarea>
+        <div class="char-count"><span id="summaryCount">0</span>/500</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="propBody">Full Description <span style="color:var(--muted);font-weight:400">(Markdown supported)</span></label>
+        <textarea class="form-textarea" id="propBody" style="min-height:160px;" placeholder="Provide detailed motivation, specification, and implementation plan…"></textarea>
+      </div>
+      <div class="wizard-nav">
+        <span></span>
+        <button class="btn btn-primary" onclick="wizardNext(0)" id="step0next" aria-label="Next: Parameters">Next →</button>
+      </div>
+    </div>
+
+    <!-- Step 1: Parameters -->
+    <div class="wizard-panel" id="wp1">
+      <div class="form-group">
+        <label class="form-label" for="votingPeriod">Voting Period</label>
+        <select class="form-select" id="votingPeriod">
+          <option value="3">3 days</option>
+          <option value="7" selected>7 days (recommended)</option>
+          <option value="14">14 days</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="quorum">Quorum (% of supply)</label>
+        <input class="form-input" id="quorum" type="number" min="1" max="50" value="10" />
+        <div class="helper">Minimum participation required for the vote to be valid.</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="threshold">Approval Threshold (%)</label>
+        <input class="form-input" id="threshold" type="number" min="50" max="100" value="66" />
+        <div class="helper">Percentage of For votes needed to pass (≥50%).</div>
+      </div>
+      <div class="wizard-nav">
+        <button class="btn btn-ghost" onclick="wizardBack(1)">← Back</button>
+        <button class="btn btn-primary" onclick="wizardNext(1)">Next →</button>
+      </div>
+    </div>
+
+    <!-- Step 2: On-chain Actions -->
+    <div class="wizard-panel" id="wp2">
+      <p style="font-size:.875rem;color:var(--muted);margin-bottom:1rem;">Optionally attach executable on-chain actions that will run if the proposal passes. Leave blank for signaling-only proposals.</p>
+      <div id="actionList"></div>
+      <button class="btn btn-ghost btn-sm" onclick="addAction()" id="addActionBtn" aria-label="Add on-chain action">+ Add Action</button>
+      <div class="wizard-nav" style="margin-top:2rem;">
+        <button class="btn btn-ghost" onclick="wizardBack(2)">← Back</button>
+        <button class="btn btn-primary" onclick="wizardNext(2)">Next →</button>
+      </div>
+    </div>
+
+    <!-- Step 3: Review -->
+    <div class="wizard-panel" id="wp3" id="reviewPanel">
+      <div style="background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:1.25rem;margin-bottom:1.5rem;" id="reviewContent"></div>
+      <div class="wizard-nav">
+        <button class="btn btn-ghost" onclick="wizardBack(3)">← Back</button>
+        <button class="btn btn-success" onclick="submitProposal()" id="submitBtn" aria-label="Submit proposal">🚀 Submit Proposal</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── DELEGATION ────────────────────────────────────────────── -->
+  <section class="section" id="sec-delegate" role="tabpanel" aria-labelledby="tab-delegate">
+    <h2 style="font-size:1.2rem;font-weight:700;margin-bottom:1.5rem;">Vote Delegation</h2>
+    <p style="font-size:.875rem;color:var(--muted);margin-bottom:1.5rem;">Delegate your voting power to a trusted representative. You retain full ownership of your tokens and can revoke delegation at any time.</p>
+
+    <div style="background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:1.25rem;margin-bottom:1.5rem;">
+      <h3 style="font-size:.9rem;font-weight:600;margin-bottom:1rem;">Delegate to custom address</h3>
+      <div style="display:flex;gap:.75rem;flex-wrap:wrap;">
+        <input class="form-input" id="delegateAddr" style="flex:1;min-width:200px;" type="text" placeholder="G... (Stellar address)" aria-label="Delegate address" />
+        <button class="btn btn-primary" onclick="delegateTo()" aria-label="Delegate voting power">Delegate</button>
+      </div>
+    </div>
+
+    <h3 style="font-size:.9rem;font-weight:600;margin-bottom:1rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;">Recommended Delegates</h3>
+    <div id="delegateList" role="list" aria-label="Recommended delegates"></div>
+  </section>
+
+  <!-- ─── CALCULATOR ────────────────────────────────────────────── -->
+  <section class="section" id="sec-calculator" role="tabpanel" aria-labelledby="tab-calculator">
+    <h2 style="font-size:1.2rem;font-weight:700;margin-bottom:1.5rem;">Voting Power Calculator</h2>
+    <div class="calc-grid">
+      <div>
+        <div class="form-group">
+          <label class="form-label" for="calcTokens">AMM Tokens held</label>
+          <input class="form-input" id="calcTokens" type="number" min="0" value="10000" oninput="updateCalc()" />
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="calcLocked">Tokens locked (multiplier x2)</label>
+          <input class="range-input" id="calcLocked" type="range" min="0" max="100" value="30" oninput="updateCalc()" aria-label="Percentage of tokens locked" />
+          <div class="range-row"><span>0%</span><span id="lockedPct">30%</span><span>100%</span></div>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="calcDelegated">Delegated to you</label>
+          <input class="form-input" id="calcDelegated" type="number" min="0" value="0" oninput="updateCalc()" />
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="calcLockDuration">Lock duration</label>
+          <select class="form-select" id="calcLockDuration" onchange="updateCalc()" aria-label="Lock duration">
+            <option value="1">1 week (1.0x)</option>
+            <option value="1.25">1 month (1.25x)</option>
+            <option value="1.5" selected>3 months (1.5x)</option>
+            <option value="2">1 year (2.0x)</option>
+          </select>
+        </div>
+      </div>
+      <div>
+        <div class="power-display" aria-live="polite" aria-label="Calculated voting power">
+          <div class="power-ring" role="img" aria-label="Voting power gauge">
+            <svg viewBox="0 0 120 120">
+              <circle cx="60" cy="60" r="50" fill="none" stroke="rgba(255,255,255,.06)" stroke-width="12"/>
+              <circle cx="60" cy="60" r="50" fill="none" stroke="url(#pg)" stroke-width="12"
+                stroke-dasharray="314" stroke-dashoffset="314" stroke-linecap="round" id="powerCircle"/>
+              <defs><linearGradient id="pg" x1="0%" y1="0%" x2="100%" y2="0%"><stop stop-color="#6c63ff"/><stop offset="1" stop-color="#00d4aa"/></linearGradient></defs>
+            </svg>
+            <div class="power-ring-val">
+              <span class="power-ring-num" id="powerNum">0</span>
+              <span class="power-ring-lbl">VP</span>
+            </div>
+          </div>
+          <div style="font-size:.85rem;color:var(--muted);">Your Voting Power</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem;width:100%;margin-top:.5rem;text-align:left;">
+            <div style="font-size:.8rem;color:var(--muted);">Base</div><div style="font-size:.8rem;text-align:right;" id="calcBase">—</div>
+            <div style="font-size:.8rem;color:var(--muted);">Lock bonus</div><div style="font-size:.8rem;text-align:right;" id="calcBonus">—</div>
+            <div style="font-size:.8rem;color:var(--muted);">Delegated</div><div style="font-size:.8rem;text-align:right;" id="calcDelegatedOut">—</div>
+            <div style="font-size:.8rem;color:var(--muted);font-weight:600;">Total VP</div><div style="font-size:.85rem;font-weight:700;text-align:right;color:var(--accent2);" id="calcTotal">—</div>
+          </div>
+          <div style="width:100%;margin-top:.75rem;padding:.75rem;background:rgba(255,255,255,.03);border-radius:8px;font-size:.78rem;color:var(--muted);">
+            Network total supply: <strong style="color:var(--text);">184M tokens</strong><br/>
+            Your share: <strong style="color:var(--accent2);" id="calcShare">0.000%</strong>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── ANALYTICS ─────────────────────────────────────────────── -->
+  <section class="section" id="sec-analytics" role="tabpanel" aria-labelledby="tab-analytics">
+    <h2 style="font-size:1.2rem;font-weight:700;margin-bottom:1.5rem;">Proposal History & Analytics</h2>
+
+    <div class="analytics-grid">
+      <!-- participation chart -->
+      <div class="chart-card">
+        <h4>Participation Rate (last 8 proposals)</h4>
+        <div class="mini-bars" id="participationChart" aria-label="Participation rate bar chart" role="img"></div>
+        <div style="display:flex;gap:2px;margin-top:.3rem;" id="participationLabels"></div>
+      </div>
+
+      <!-- outcome breakdown -->
+      <div class="chart-card">
+        <h4>Outcome Breakdown</h4>
+        <div style="display:flex;flex-direction:column;gap:.6rem;" id="outcomeBreakdown" aria-label="Outcome breakdown" role="img"></div>
+      </div>
+
+      <!-- category distribution -->
+      <div class="chart-card">
+        <h4>Category Distribution</h4>
+        <div style="display:flex;flex-direction:column;gap:.6rem;" id="categoryDist" aria-label="Category distribution" role="img"></div>
+      </div>
+
+      <!-- avg voting time -->
+      <div class="chart-card">
+        <h4>Avg. Decision Speed</h4>
+        <div style="display:flex;flex-direction:column;gap:.5rem;" id="speedMetrics"></div>
+      </div>
+    </div>
+
+    <!-- History table -->
+    <div class="chart-card" style="overflow-x:auto;">
+      <h4 style="margin-bottom:1rem;">Full Proposal History</h4>
+      <table style="width:100%;border-collapse:collapse;font-size:.85rem;" role="table" aria-label="Full proposal history">
+        <thead>
+          <tr style="border-bottom:1px solid var(--border);">
+            <th style="text-align:left;padding:.5rem .75rem;color:var(--muted);font-weight:500;" scope="col">#</th>
+            <th style="text-align:left;padding:.5rem .75rem;color:var(--muted);font-weight:500;" scope="col">Title</th>
+            <th style="text-align:left;padding:.5rem .75rem;color:var(--muted);font-weight:500;" scope="col">Status</th>
+            <th style="text-align:right;padding:.5rem .75rem;color:var(--muted);font-weight:500;" scope="col">For</th>
+            <th style="text-align:right;padding:.5rem .75rem;color:var(--muted);font-weight:500;" scope="col">Against</th>
+            <th style="text-align:right;padding:.5rem .75rem;color:var(--muted);font-weight:500;" scope="col">Participation</th>
+          </tr>
+        </thead>
+        <tbody id="historyTable"></tbody>
+      </table>
+    </div>
+  </section>
+
+</main>
+
+<!-- ─── PROPOSAL DETAIL MODAL ─────────────────────────────────────── -->
+<div class="overlay" id="proposalModal" role="dialog" aria-modal="true" aria-labelledby="modalTitle" onclick="closeModal(event)">
+  <div class="modal" id="modalContent">
+    <div class="modal-header">
+      <div>
+        <div id="modalMeta" style="display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.5rem;"></div>
+        <h2 id="modalTitle" style="font-size:1.15rem;font-weight:700;"></h2>
+      </div>
+      <button class="modal-close" onclick="closeModal()" aria-label="Close proposal detail">✕</button>
+    </div>
+
+    <div class="modal-section">
+      <h4>Description</h4>
+      <p id="modalDesc" style="font-size:.875rem;color:var(--muted);"></p>
+    </div>
+
+    <div class="modal-section">
+      <h4>Voting Progress</h4>
+      <div class="vote-bar-wrap" id="modalVoteBar"></div>
+      <div style="display:flex;justify-content:space-between;font-size:.8rem;margin-top:.5rem;">
+        <span style="color:var(--accent2);">✓ For: <strong id="modalFor"></strong></span>
+        <span>Quorum: <strong id="modalQuorum"></strong></span>
+        <span style="color:var(--danger);">✗ Against: <strong id="modalAgainst"></strong></span>
+      </div>
+    </div>
+
+    <div class="modal-section" id="modalVoteSection">
+      <h4>Cast Your Vote</h4>
+      <div style="display:flex;gap:.75rem;flex-wrap:wrap;" id="modalVoteActions"></div>
+    </div>
+
+    <div class="modal-section">
+      <h4>Timeline</h4>
+      <div id="modalTimeline" style="font-size:.85rem;color:var(--muted);display:flex;flex-direction:column;gap:.3rem;"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ─── TOASTS ─────────────────────────────────────────────────────── -->
+<div id="toasts" aria-live="polite" aria-atomic="true"></div>
+
+<!-- ═══════════════════════════════ SCRIPT ════════════════════════════════ -->
+<script>
+/* ── Data ─────────────────────────────────────────────────────────── */
+const SUPPLY = 184_000_000;
+
+const proposals = [
+  { id:'GIP-012', title:'Increase max pool fee to 1.5%', cat:'params', status:'active',
+    summary:'Raise the ceiling on swap fees from 1.0% to 1.5% to allow high-volatility pair pools to compete.',
+    body:'Currently the maximum swap fee is capped at 1.0%, which creates pricing pressure issues for highly volatile asset pairs. Raising the ceiling allows pool owners to set appropriate fees while keeping defaults unchanged.',
+    forVotes:8_200_000, againstVotes:3_100_000, quorumPct:10,
+    created:'2026-05-25', ends:'2026-06-05', author:'GAXYZ…1234' },
+  { id:'GIP-011', title:'Deploy liquidity mining incentives Season 4', cat:'treasury', status:'active',
+    summary:'Allocate 2.4M AMM tokens from treasury to fund the next three-month liquidity mining program.',
+    body:'Season 3 concluded with TVL growth of 43%. This proposal requests continued incentive funding for key pairs: XLM/USDC, BTC/XLM, and ETH/XLM.',
+    forVotes:12_500_000, againstVotes:900_000, quorumPct:10,
+    created:'2026-05-22', ends:'2026-06-03', author:'GBWXY…5678' },
+  { id:'GIP-010', title:'Upgrade AMM core to v2.1 (concentrated liquidity)', cat:'protocol', status:'pending',
+    summary:'Adopt the Soroban SDK v21 concentrated liquidity primitives across all pool types.',
+    body:'Full spec in forum post #2894. Timeline: testnet deploy June 15, mainnet vote June 30.',
+    forVotes:0, againstVotes:0, quorumPct:15,
+    created:'2026-06-01', ends:'2026-06-14', author:'GCABC…9012' },
+  { id:'GIP-009', title:'Reduce protocol fee to 0.05%', cat:'params', status:'passed',
+    summary:'Lower the base protocol fee from 0.10% to 0.05% to improve competitiveness.',
+    body:'Analysis shows fee reduction increases volume by ~30% based on elasticity modelling.',
+    forVotes:16_800_000, againstVotes:2_200_000, quorumPct:10,
+    created:'2026-04-10', ends:'2026-04-17', author:'GDUVW…3456' },
+  { id:'GIP-008', title:'Emergency pause of XYZ/USDC pool', cat:'protocol', status:'failed',
+    summary:'Temporarily pause the XYZ/USDC pool due to oracle manipulation risk.',
+    body:'Insufficient consensus was reached before the risk window closed.',
+    forVotes:4_500_000, againstVotes:9_200_000, quorumPct:10,
+    created:'2026-03-02', ends:'2026-03-05', author:'GFQRS…7890' },
+];
+
+const delegates = [
+  { name:'StellarDev', addr:'GAAA…1111', power:'2.4M VP', participation:'98%', bio:'Protocol contributor, 3y governance veteran' },
+  { name:'AMMResearch', addr:'GBBB…2222', power:'1.1M VP', participation:'94%', bio:'Independent researcher, focus on tokenomics' },
+  { name:'LiquidityDAO', addr:'GCCC…3333', power:'3.8M VP', participation:'88%', bio:'Representing 42 community delegates' },
+  { name:'SorobanLabs', addr:'GDDD…4444', power:'0.8M VP', participation:'100%', bio:'Core team delegate (recused on team proposals)' },
+];
+
+const history = [...proposals].reverse();
+
+/* ── State ────────────────────────────────────────────────────────── */
+let votes = {}; // { proposalId: 'for'|'against'|'abstain' }
+let walletConnected = false;
+let currentWizardStep = 0;
+let actions = [];
+
+/* ── Init ─────────────────────────────────────────────────────────── */
+document.addEventListener('DOMContentLoaded', () => {
+  renderProposals();
+  renderDelegates();
+  renderAnalytics();
+  initWizard();
+  updateCalc();
+  setupFilters();
+  setupCharCounts();
+});
+
+/* ── Tabs ─────────────────────────────────────────────────────────── */
+document.getElementById('tablist').addEventListener('click', e => {
+  const btn = e.target.closest('[data-tab]');
+  if (!btn) return;
+  document.querySelectorAll('.tab').forEach(t => { t.classList.remove('active'); t.setAttribute('aria-selected','false'); });
+  document.querySelectorAll('.section').forEach(s => s.classList.remove('visible'));
+  btn.classList.add('active');
+  btn.setAttribute('aria-selected','true');
+  document.getElementById('sec-' + btn.dataset.tab).classList.add('visible');
+  if (btn.dataset.tab === 'analytics') renderAnalytics();
+});
+
+/* ── Proposals ────────────────────────────────────────────────────── */
+function renderProposals(filter = {}) {
+  const list = document.getElementById('proposalList');
+  let items = proposals.filter(p => {
+    if (filter.status && p.status !== filter.status) return false;
+    if (filter.cat && p.cat !== filter.cat) return false;
+    return true;
+  });
+  list.innerHTML = items.map(p => proposalCard(p)).join('');
+}
+
+function proposalCard(p) {
+  const total = p.forVotes + p.againstVotes;
+  const forPct = total ? Math.round(p.forVotes / total * 100) : 0;
+  const againstPct = total ? 100 - forPct : 0;
+  const myVote = votes[p.id];
+
+  return `<article class="proposal-card" role="listitem" onclick="openProposal('${p.id}')" tabindex="0"
+    onkeydown="if(event.key==='Enter')openProposal('${p.id}')"
+    aria-label="Proposal ${p.id}: ${p.title}">
+    <div class="proposal-meta">
+      <span class="badge badge-${p.status}">${p.status}</span>
+      <span class="badge badge-cat">${p.cat}</span>
+      <span class="proposal-id">${p.id}</span>
+      ${myVote ? `<span class="badge" style="background:rgba(108,99,255,.2);color:var(--accent);">You voted: ${myVote}</span>` : ''}
+    </div>
+    <div class="proposal-title">${p.title}</div>
+    <div class="proposal-desc">${p.summary}</div>
+    ${total > 0 ? `
+    <div class="vote-bar-wrap" role="img" aria-label="Voting: ${forPct}% for, ${againstPct}% against">
+      <div class="vote-bar-labels"><span style="color:var(--accent2)">✓ ${fmtNum(p.forVotes)} (${forPct}%)</span><span style="color:var(--danger)">✗ ${fmtNum(p.againstVotes)} (${againstPct}%)</span></div>
+      <div class="vote-bar">
+        <div class="vote-bar-fill" style="width:${forPct}%"></div>
+        <div class="vote-bar-against" style="width:${againstPct}%"></div>
+      </div>
+    </div>` : '<div style="font-size:.8rem;color:var(--muted);margin:.4rem 0;">No votes yet</div>'}
+    <div class="proposal-footer">
+      <span>By ${p.author} · Created ${p.created}</span>
+      <span style="color:${p.status==='active'?'var(--warn)':'var(--muted)'}">
+        ${p.status==='active' ? '⏱ Ends '+p.ends : p.status==='pending' ? '📅 Opens '+p.ends : '✓ Closed '+p.ends}
+      </span>
+      ${p.status==='active' ? `<div class="vote-actions" onclick="event.stopPropagation()">
+        <button class="btn btn-success btn-sm${myVote==='for'?' btn-sm':''}" onclick="castVote('${p.id}','for')" aria-label="Vote for proposal ${p.id}">👍 For</button>
+        <button class="btn btn-danger  btn-sm" onclick="castVote('${p.id}','against')" aria-label="Vote against proposal ${p.id}">👎 Against</button>
+        <button class="btn btn-ghost   btn-sm" onclick="castVote('${p.id}','abstain')" aria-label="Abstain from proposal ${p.id}">◦ Abstain</button>
+      </div>` : ''}
+    </div>
+  </article>`;
+}
+
+function setupFilters() {
+  ['filterStatus','filterCat'].forEach(id => {
+    document.getElementById(id).addEventListener('change', () => {
+      renderProposals({ status: document.getElementById('filterStatus').value, cat: document.getElementById('filterCat').value });
+    });
+  });
+}
+
+/* ── Vote ─────────────────────────────────────────────────────────── */
+function castVote(id, choice) {
+  if (votes[id] === choice) { toast('Already voted '+choice,'error'); return; }
+  votes[id] = choice;
+  const p = proposals.find(x => x.id === id);
+  if (choice === 'for')     p.forVotes     += 50_000;
+  if (choice === 'against') p.againstVotes += 50_000;
+  renderProposals({ status: document.getElementById('filterStatus').value, cat: document.getElementById('filterCat').value });
+  toast(`Vote cast: <strong>${choice}</strong> on ${id}`,'success');
+}
+
+/* ── Modal ────────────────────────────────────────────────────────── */
+function openProposal(id) {
+  const p = proposals.find(x => x.id === id);
+  const total = p.forVotes + p.againstVotes;
+  const forPct = total ? Math.round(p.forVotes/total*100) : 0;
+
+  document.getElementById('modalMeta').innerHTML = `<span class="badge badge-${p.status}">${p.status}</span><span class="badge badge-cat">${p.cat}</span><span class="proposal-id">${p.id}</span>`;
+  document.getElementById('modalTitle').textContent = p.title;
+  document.getElementById('modalDesc').textContent = p.body;
+  document.getElementById('modalFor').textContent = fmtNum(p.forVotes);
+  document.getElementById('modalAgainst').textContent = fmtNum(p.againstVotes);
+  document.getElementById('modalQuorum').textContent = p.quorumPct+'%';
+  document.getElementById('modalVoteBar').innerHTML = `
+    <div class="vote-bar-labels"><span style="color:var(--accent2)">✓ ${forPct}%</span><span style="color:var(--danger)">✗ ${100-forPct}%</span></div>
+    <div class="vote-bar" style="height:10px;">
+      <div class="vote-bar-fill" style="width:${forPct}%"></div>
+      <div class="vote-bar-against" style="width:${100-forPct}%"></div>
+    </div>`;
+  document.getElementById('modalTimeline').innerHTML = `<span>Created: ${p.created}</span><span>${p.status==='active'?'Ends':'Closed'}: ${p.ends}</span><span>Author: ${p.author}</span>`;
+
+  const vs = document.getElementById('modalVoteActions');
+  if (p.status === 'active') {
+    vs.innerHTML = `
+      <button class="btn btn-success" onclick="castVote('${p.id}','for');closeModal()" aria-label="Vote for">👍 Vote For</button>
+      <button class="btn btn-danger"  onclick="castVote('${p.id}','against');closeModal()" aria-label="Vote against">👎 Vote Against</button>
+      <button class="btn btn-ghost"   onclick="castVote('${p.id}','abstain');closeModal()" aria-label="Abstain">◦ Abstain</button>`;
+    document.getElementById('modalVoteSection').style.display = '';
+  } else {
+    document.getElementById('modalVoteSection').style.display = 'none';
+  }
+
+  document.getElementById('proposalModal').classList.add('open');
+  document.getElementById('modalContent').focus();
+}
+
+function closeModal(e) {
+  if (e && e.target !== document.getElementById('proposalModal')) return;
+  document.getElementById('proposalModal').classList.remove('open');
+}
+document.addEventListener('keydown', e => { if (e.key==='Escape') document.getElementById('proposalModal').classList.remove('open'); });
+
+/* ── Wizard ────────────────────────────────────────────────────────── */
+function initWizard() { currentWizardStep = 0; showStep(0); }
+
+function showStep(n) {
+  document.querySelectorAll('.wizard-panel').forEach((p,i) => p.classList.toggle('active', i===n));
+  document.querySelectorAll('.wstep').forEach((s,i) => {
+    s.classList.remove('active','done');
+    if (i < n) s.classList.add('done');
+    else if (i===n) s.classList.add('active');
+    s.querySelector('.wstep-dot').setAttribute('aria-current', i===n ? 'step' : 'false');
+  });
+  currentWizardStep = n;
+  if (n === 3) buildReview();
+}
+
+function wizardNext(step) {
+  if (step === 0) {
+    if (!document.getElementById('propTitle').value.trim()) { toast('Title is required','error'); return; }
+    if (!document.getElementById('propCategory').value)     { toast('Category is required','error'); return; }
+    if (!document.getElementById('propSummary').value.trim()){ toast('Summary is required','error'); return; }
+  }
+  showStep(step + 1);
+}
+function wizardBack(step) { showStep(step - 1); }
+
+function addAction() {
+  const idx = actions.length;
+  actions.push({ contract:'', fn:'', args:'' });
+  const div = document.createElement('div');
+  div.style.cssText='background:var(--card);border:1px solid var(--border);border-radius:8px;padding:1rem;margin-bottom:.75rem;';
+  div.innerHTML = `
+    <div style="display:flex;justify-content:space-between;margin-bottom:.5rem;"><strong style="font-size:.85rem;">Action ${idx+1}</strong><button class="btn btn-ghost btn-sm" onclick="this.parentElement.parentElement.remove()" aria-label="Remove action">✕</button></div>
+    <div class="form-group"><label class="form-label" for="ac${idx}">Contract ID</label><input class="form-input" id="ac${idx}" placeholder="C..." /></div>
+    <div class="form-group"><label class="form-label" for="af${idx}">Function</label><input class="form-input" id="af${idx}" placeholder="set_fee_rate" /></div>
+    <div class="form-group"><label class="form-label" for="aa${idx}">Arguments <span>(JSON)</span></label><input class="form-input" id="aa${idx}" placeholder='{"bps": 150}' /></div>`;
+  document.getElementById('actionList').appendChild(div);
+}
+
+function buildReview() {
+  const t = document.getElementById('propTitle').value;
+  const c = document.getElementById('propCategory').value;
+  const s = document.getElementById('propSummary').value;
+  const vp = document.getElementById('votingPeriod').value;
+  const q  = document.getElementById('quorum').value;
+  const th = document.getElementById('threshold').value;
+  document.getElementById('reviewContent').innerHTML = `
+    <h3 style="font-size:1rem;font-weight:700;margin-bottom:1rem;">${t||'—'}</h3>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem 1rem;font-size:.85rem;margin-bottom:1rem;">
+      <span style="color:var(--muted)">Category</span><span>${c||'—'}</span>
+      <span style="color:var(--muted)">Voting period</span><span>${vp} days</span>
+      <span style="color:var(--muted)">Quorum</span><span>${q}%</span>
+      <span style="color:var(--muted)">Approval threshold</span><span>${th}%</span>
+    </div>
+    <div style="font-size:.85rem;color:var(--muted);">${s||'—'}</div>`;
+}
+
+function submitProposal() {
+  const t = document.getElementById('propTitle').value;
+  const cat = document.getElementById('propCategory').value;
+  const s = document.getElementById('propSummary').value;
+  const newId = 'GIP-0' + (proposals.length + 10);
+  proposals.unshift({ id:newId, title:t, cat, status:'pending', summary:s, body:s,
+    forVotes:0, againstVotes:0, quorumPct:+document.getElementById('quorum').value,
+    created:new Date().toISOString().slice(0,10),
+    ends: new Date(Date.now() + +document.getElementById('votingPeriod').value * 86400000).toISOString().slice(0,10),
+    author:'You' });
+  toast(`Proposal <strong>${newId}</strong> submitted!`,'success');
+  ['propTitle','propSummary','propBody'].forEach(id => document.getElementById(id).value='');
+  document.getElementById('propCategory').value='';
+  document.getElementById('actionList').innerHTML='';
+  actions=[];
+  showStep(0);
+  document.querySelector('[data-tab="proposals"]').click();
+}
+
+/* ── Char counters ────────────────────────────────────────────────── */
+function setupCharCounts() {
+  document.getElementById('propTitle').addEventListener('input', function(){ document.getElementById('titleCount').textContent=this.value.length; });
+  document.getElementById('propSummary').addEventListener('input', function(){ document.getElementById('summaryCount').textContent=this.value.length; });
+}
+
+/* ── Delegates ────────────────────────────────────────────────────── */
+function renderDelegates() {
+  document.getElementById('delegateList').innerHTML = delegates.map(d => `
+    <div class="delegate-card" role="listitem">
+      <div class="avatar" aria-hidden="true">${d.name.slice(0,2).toUpperCase()}</div>
+      <div class="delegate-info">
+        <div class="delegate-name">${d.name}</div>
+        <div class="delegate-meta">${d.addr} · ${d.participation} participation · ${d.bio}</div>
+      </div>
+      <span class="delegate-power">${d.power}</span>
+      <button class="btn btn-primary btn-sm" onclick="delegateTo('${d.addr}')" aria-label="Delegate to ${d.name}">Delegate</button>
+    </div>`).join('');
+}
+
+function delegateTo(addr) {
+  const a = addr || document.getElementById('delegateAddr').value.trim();
+  if (!a) { toast('Enter a valid Stellar address','error'); return; }
+  toast(`Delegated to <strong>${a}</strong>`,'success');
+}
+
+/* ── Voting Power Calc ────────────────────────────────────────────── */
+function updateCalc() {
+  const tokens    = +document.getElementById('calcTokens').value    || 0;
+  const lockedPct = +document.getElementById('calcLocked').value    || 0;
+  const delegated = +document.getElementById('calcDelegated').value || 0;
+  const mult      = +document.getElementById('calcLockDuration').value || 1;
+  document.getElementById('lockedPct').textContent = lockedPct + '%';
+
+  const locked   = Math.round(tokens * lockedPct / 100);
+  const unlocked = tokens - locked;
+  const base     = unlocked + locked * mult;
+  const bonus    = locked * (mult - 1);
+  const total    = Math.round(base + delegated);
+
+  document.getElementById('calcBase').textContent    = fmtNum(Math.round(base));
+  document.getElementById('calcBonus').textContent   = '+' + fmtNum(Math.round(bonus));
+  document.getElementById('calcDelegatedOut').textContent = '+' + fmtNum(delegated);
+  document.getElementById('calcTotal').textContent   = fmtNum(total);
+  document.getElementById('powerNum').textContent    = fmtNum(total);
+  document.getElementById('calcShare').textContent   = ((total / SUPPLY) * 100).toFixed(3) + '%';
+
+  // animate ring
+  const pct = Math.min(total / (SUPPLY * 0.05), 1); // scale: 5% supply = full ring
+  const circumference = 314;
+  document.getElementById('powerCircle').style.strokeDashoffset = circumference * (1 - pct);
+}
+
+/* ── Analytics ────────────────────────────────────────────────────── */
+function renderAnalytics() {
+  // participation bar chart
+  const participationData = [8.2, 14.1, 11.6, 9.4, 17.3, 12.8, 10.1, 15.9];
+  const maxP = Math.max(...participationData);
+  const pc = document.getElementById('participationChart');
+  const pl = document.getElementById('participationLabels');
+  if (!pc.children.length) {
+    participationData.forEach((v, i) => {
+      const bar = document.createElement('div');
+      bar.className = 'mini-bar';
+      bar.style.height = '0px';
+      bar.title = v + '% participation';
+      bar.setAttribute('role','img');
+      bar.setAttribute('aria-label',`Proposal ${proposals.length - participationData.length + i + 1}: ${v}% participation`);
+      pc.appendChild(bar);
+      setTimeout(() => { bar.style.height = Math.round(v/maxP*76) + 'px'; }, i * 60 + 100);
+
+      const lbl = document.createElement('div');
+      lbl.className = 'mini-bar-label'; lbl.style.flex='1';
+      lbl.textContent = 'P'+(i+1);
+      pl.appendChild(lbl);
+    });
+  }
+
+  // outcome
+  const oc = document.getElementById('outcomeBreakdown');
+  if (!oc.children.length) {
+    [['Passed','var(--accent2)',3],['Failed','var(--danger)',1],['Active','var(--warn)',4],['Pending','var(--muted)',1]].forEach(([l,c,n]) => {
+      const row = document.createElement('div');
+      row.style.cssText='display:flex;align-items:center;gap:.75rem;font-size:.85rem;';
+      row.innerHTML = `<span style="width:90px;color:var(--muted);">${l}</span><div style="flex:1;height:8px;border-radius:4px;background:rgba(255,255,255,.06);overflow:hidden;"><div style="height:100%;background:${c};border-radius:4px;width:${Math.round(n/9*100)}%;transition:width .6s ease;"></div></div><span style="width:20px;text-align:right;font-weight:600;">${n}</span>`;
+      oc.appendChild(row);
+    });
+  }
+
+  // category
+  const cd = document.getElementById('categoryDist');
+  if (!cd.children.length) {
+    [['Protocol','var(--accent)',3],['Treasury','var(--accent2)',2],['Parameters','var(--warn)',3],['Meta','var(--muted)',1]].forEach(([l,c,n]) => {
+      const row = document.createElement('div');
+      row.style.cssText='display:flex;align-items:center;gap:.75rem;font-size:.85rem;';
+      row.innerHTML = `<span style="width:90px;color:var(--muted);">${l}</span><div style="flex:1;height:8px;border-radius:4px;background:rgba(255,255,255,.06);overflow:hidden;"><div style="height:100%;background:${c};border-radius:4px;width:${Math.round(n/9*100)}%;transition:width .6s ease;"></div></div><span style="width:20px;text-align:right;font-weight:600;">${n}</span>`;
+      cd.appendChild(row);
+    });
+  }
+
+  // speed
+  const sm = document.getElementById('speedMetrics');
+  if (!sm.children.length) {
+    [['Avg. time to quorum','2.3 days'],['Avg. voting period','7 days'],['Fastest proposal','18h'],['Largest turnout','17.3%']].forEach(([l,v]) => {
+      sm.innerHTML += `<div style="display:flex;justify-content:space-between;font-size:.875rem;padding:.4rem 0;border-bottom:1px solid var(--border);"><span style="color:var(--muted);">${l}</span><strong>${v}</strong></div>`;
+    });
+  }
+
+  // history table
+  const tb = document.getElementById('historyTable');
+  if (!tb.children.length) {
+    history.forEach(p => {
+      const total = p.forVotes + p.againstVotes;
+      const forPct = total ? Math.round(p.forVotes/total*100) : 0;
+      const par = total ? ((total/SUPPLY)*100).toFixed(1)+'%' : '—';
+      tb.innerHTML += `<tr style="border-bottom:1px solid var(--border);">
+        <td style="padding:.5rem .75rem;color:var(--muted);">${p.id}</td>
+        <td style="padding:.5rem .75rem;">${p.title}</td>
+        <td style="padding:.5rem .75rem;"><span class="badge badge-${p.status}">${p.status}</span></td>
+        <td style="padding:.5rem .75rem;text-align:right;color:var(--accent2);">${forPct}%</td>
+        <td style="padding:.5rem .75rem;text-align:right;color:var(--danger);">${100-forPct}%</td>
+        <td style="padding:.5rem .75rem;text-align:right;">${par}</td>
+      </tr>`;
+    });
+  }
+}
+
+/* ── Wallet ───────────────────────────────────────────────────────── */
+document.getElementById('connectWalletBtn').addEventListener('click', () => {
+  walletConnected = !walletConnected;
+  const btn = document.getElementById('connectWalletBtn');
+  if (walletConnected) {
+    btn.textContent = 'GXXX…1234'; btn.style.background='var(--accent2)'; btn.style.color='#0b0f1a';
+    document.getElementById('stat-power').textContent = '24,500';
+    document.querySelector('.wallet-pill').innerHTML = '<span class="dot"></span>Connected';
+    toast('Wallet connected (demo mode)','success');
+  } else {
+    btn.textContent = 'Connect Wallet'; btn.style.background=''; btn.style.color='';
+    document.getElementById('stat-power').textContent = '—';
+    document.querySelector('.wallet-pill').innerHTML = '<span class="dot"></span>Read-only mode';
+  }
+});
+
+/* ── Helpers ──────────────────────────────────────────────────────── */
+function fmtNum(n) {
+  if (n >= 1_000_000) return (n/1_000_000).toFixed(1)+'M';
+  if (n >= 1_000)     return (n/1_000).toFixed(1)+'K';
+  return n.toLocaleString();
+}
+
+function toast(msg, type='success') {
+  const el = document.createElement('div');
+  el.className = `toast toast-${type}`;
+  el.setAttribute('role','alert');
+  el.innerHTML = (type==='success'?'✓ ':'✕ ') + msg;
+  document.getElementById('toasts').appendChild(el);
+  setTimeout(() => el.remove(), 4000);
+}
+</script>
+</body>
+</html>

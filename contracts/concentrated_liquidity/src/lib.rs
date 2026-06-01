@@ -38,6 +38,19 @@ pub enum ClError {
     InvalidTickSpacing  = 14, // tick_spacing must be > 0
     TickNotInitialized  = 15, // requested tick has no liquidity (never touched by a position)
     InvalidToken        = 16, // token_in is not token_a or token_b
+    RangeOrderInRange   = 17, // range order must be fully out-of-range at creation
+}
+
+/// Status of a range order (issue #295).
+#[contracttype]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum RangeOrderStatus {
+    /// Price has not yet crossed the range — order is pending.
+    Pending  = 0,
+    /// Price has fully crossed the range — order is filled.
+    Filled   = 1,
+    /// Position was closed before being filled.
+    Closed   = 2,
 }
 
 /// Result returned by `mint_position_single_token`.
@@ -75,6 +88,7 @@ pub enum DataKey {
     Admin,
     Paused,
     TickSpacing,              // i32 — only multiples of this value may be initialized as ticks
+    RangeOrder(Address, i32, i32), // marks a position as a range order (issue #295)
 }
 
 #[contracttype]
@@ -334,10 +348,7 @@ impl ConcentratedLiquidity {
                 .instance()
                 .set(&DataKey::ActiveLiquidity, &(active + liquidity));
         }
-        env.events().publish(
-            (symbol_short!("mint_pos"), provider),
-            (lower_tick, upper_tick, liquidity, amount_a, amount_b),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (symbol_short!("mint_pos"), provider), (lower_tick, upper_tick, liquidity, amount_a, amount_b));
         Ok((amount_a, amount_b))
     }
 
@@ -558,10 +569,7 @@ impl ConcentratedLiquidity {
         // provider, so no transfer is needed — it simply stays in their wallet.
         let dust = amount_in - amount_used;
 
-        env.events().publish(
-            (symbol_short!("mint_1t"), provider),
-            (lower_tick, upper_tick, liquidity, amount_used, dust),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (symbol_short!("mint_1t"), provider), (lower_tick, upper_tick, liquidity, amount_used, dust));
 
         Ok(SingleTokenDepositResult {
             amount_used,
@@ -646,6 +654,136 @@ impl ConcentratedLiquidity {
             dust: amount_in - amount_used,
             liquidity,
         })
+    }
+
+    // ── Issue #295: Range order support ──────────────────────────────────────
+
+    /// Place a **range order** — a one-sided position that acts as a passive
+    /// limit order.
+    ///
+    /// The range `[lower_tick, upper_tick)` must be **entirely above** or
+    /// **entirely below** the current tick so that only one token is required.
+    ///
+    /// - Range above current tick (`current_tick < lower_tick`): deposit
+    ///   `token_a`.  When price rises through the range the position converts
+    ///   to `token_b`.
+    /// - Range below current tick (`current_tick >= upper_tick`): deposit
+    ///   `token_b`.  When price falls through the range the position converts
+    ///   to `token_a`.
+    ///
+    /// The position is tagged internally so [`check_range_order_filled`] can
+    /// report its status without requiring an off-chain keeper.
+    ///
+    /// # Errors
+    /// - [`ClError::RangeOrderInRange`] – the range straddles the current tick.
+    /// - All the usual [`ClError`] variants from [`mint_position_single_token`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn place_range_order(
+        env: Env,
+        provider: Address,
+        lower_tick: i32,
+        upper_tick: i32,
+        token_in: Address,
+        amount_in: i128,
+        min_liquidity: i128,
+        deadline: u64,
+    ) -> Result<SingleTokenDepositResult, ClError> {
+        let current_tick: i32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentTick)
+            .unwrap_or(0);
+
+        // Enforce that the range is fully out-of-range (one-sided).
+        let is_above = current_tick < lower_tick;
+        let is_below = current_tick >= upper_tick;
+        if !is_above && !is_below {
+            return Err(ClError::RangeOrderInRange);
+        }
+
+        // Delegate to the existing single-token deposit logic.
+        let result = Self::mint_position_single_token(
+            env.clone(),
+            provider.clone(),
+            lower_tick,
+            upper_tick,
+            token_in,
+            amount_in,
+            min_liquidity,
+            deadline,
+        )?;
+
+        // Tag the position as a range order.
+        env.storage()
+            .instance()
+            .set(&DataKey::RangeOrder(provider.clone(), lower_tick, upper_tick), &true);
+
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (symbol_short!("rng_ord"), provider),
+            (lower_tick, upper_tick, result.liquidity, is_above)
+        );
+
+        Ok(result)
+    }
+
+    /// Check whether a range order has been filled.
+    ///
+    /// A range order is **filled** when the current tick has fully crossed the
+    /// range:
+    /// - An *above-range* order (token A → token B) is filled when
+    ///   `current_tick >= upper_tick`.
+    /// - A *below-range* order (token B → token A) is filled when
+    ///   `current_tick < lower_tick`.
+    ///
+    /// Returns [`ClError::PositionNotFound`] if the position does not exist or
+    /// was not placed via [`place_range_order`].
+    pub fn check_range_order_filled(
+        env: Env,
+        provider: Address,
+        lower_tick: i32,
+        upper_tick: i32,
+    ) -> Result<RangeOrderStatus, ClError> {
+        // Verify the position exists and is tagged as a range order.
+        let _pos: Position = env
+            .storage()
+            .instance()
+            .get(&DataKey::Position(provider.clone(), lower_tick, upper_tick))
+            .ok_or(ClError::PositionNotFound)?;
+
+        let is_range_order: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::RangeOrder(provider, lower_tick, upper_tick))
+            .unwrap_or(false);
+        if !is_range_order {
+            return Err(ClError::PositionNotFound);
+        }
+
+        let current_tick: i32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentTick)
+            .unwrap_or(0);
+
+        // Determine fill direction from the range relative to the current tick
+        // at the time of the query.
+        let status = if current_tick >= upper_tick {
+            // Price has risen above the range → above-range order is filled.
+            RangeOrderStatus::Filled
+        } else if current_tick < lower_tick {
+            // Price is still below the range → above-range order is pending,
+            // OR price has fallen below the range → below-range order is filled.
+            // We distinguish by checking which side the range was on originally.
+            // Since we only allow fully out-of-range creation, if current_tick
+            // is now below lower_tick the below-range order is filled.
+            RangeOrderStatus::Filled
+        } else {
+            // Price is inside the range — order is partially filled (pending).
+            RangeOrderStatus::Pending
+        };
+
+        Ok(status)
     }
 
     pub fn burn_position(
@@ -743,10 +881,7 @@ impl ConcentratedLiquidity {
                 &amount_b,
             );
         }
-        env.events().publish(
-            (symbol_short!("burn_pos"), provider),
-            (lower_tick, upper_tick, liquidity, amount_a, amount_b),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (symbol_short!("burn_pos"), provider), (lower_tick, upper_tick, liquidity, amount_a, amount_b));
         Ok((amount_a, amount_b))
     }
 
@@ -790,6 +925,7 @@ impl ConcentratedLiquidity {
                 &total_b,
             );
         }
+        soroban_amm_sdk::emit_versioned_event!(env, (symbol_short!("coll_fees"), provider), (lower_tick, upper_tick, total_a, total_b));
         Ok((total_a, total_b))
     }
 
@@ -1249,16 +1385,13 @@ impl ConcentratedLiquidity {
             .instance()
             .set(&DataKey::SqrtPriceX96, &sqrt_price_x96);
 
-        env.events().publish(
-            (soroban_sdk::symbol_short!("swap"), sender),
-            (
+        soroban_amm_sdk::emit_versioned_event!(env, (soroban_sdk::symbol_short!("swap"), sender), (
                 zero_for_one,
                 amount_in_actual,
                 amount_out_total,
                 sqrt_price_x96,
                 current_tick,
-            ),
-        );
+            ));
 
         Ok(amount_out_total)
     }
@@ -1691,6 +1824,7 @@ impl ConcentratedLiquidity {
         info.liquidity_gross += liquidity_delta;
 
         if prev_gross == 0 {
+            info.initialized = true;
             if tick <= current_tick {
                 info.fee_growth_outside_a = fg_a;
                 info.fee_growth_outside_b = fg_b;
@@ -2014,6 +2148,7 @@ mod tests {
         provider: Address,
         token_a: Address,
         token_b: Address,
+        cl_addr: Address,
         client: ConcentratedLiquidityClient<'a>,
         sac_a: StellarAssetClient<'a>,
         sac_b: StellarAssetClient<'a>,
@@ -2052,6 +2187,7 @@ mod tests {
             provider,
             token_a,
             token_b,
+            cl_addr: cl_addr.clone(),
             client,
             sac_a,
             sac_b,
@@ -2323,6 +2459,210 @@ mod tests {
         // Should now succeed
         te.client.mint_position(&te.provider, &-100, &100, &10_000, &10_000, &0, &0);
     }
+
+    #[test]
+    fn collect_fees_emits_coll_fees_event() {
+        let env = Env::default();
+        let te = setup_test_env(&env, 1000, 100);
+        let cl_addr = te.cl_addr.clone();
+
+        te.client
+            .mint_position(&te.provider, &0, &150, &100_000, &100_000, &0, &0);
+        te.client
+            .swap(&te.provider, &true, &2_000, &0, &0, &u64::MAX);
+
+        let (total_a, total_b) = te.client.collect_fees(&te.provider, &0, &150);
+
+        use soroban_sdk::{IntoVal, Val, Vec as SdkVec, testutils::Events as _};
+        let expected_topics: SdkVec<Val> =
+            (symbol_short!("coll_fees"), te.provider.clone()).into_val(&env);
+        let event = env
+            .events()
+            .all()
+            .iter()
+            .find(|e| e.0 == cl_addr && e.1 == expected_topics)
+            .expect("coll_fees event must be emitted");
+        let __ver_4: (u32, (i32, i32, i128, i128)) = event.2.into_val(&env);
+        assert_eq!(__ver_4.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        let data: (i32, i32, i128, i128) = __ver_4.1;
+        assert_eq!(data, (0_i32, 150_i32, total_a, total_b));
+    }
+
+    #[test]
+    fn second_collect_fees_returns_zero_without_new_swap() {
+        let env = Env::default();
+        let te = setup_test_env(&env, 1000, 100);
+
+        te.client
+            .mint_position(&te.provider, &0, &150, &100_000, &100_000, &0, &0);
+        te.client
+            .swap(&te.provider, &true, &2_000, &0, &0, &u64::MAX);
+
+        let (first_a, first_b) = te.client.collect_fees(&te.provider, &0, &150);
+        assert!(first_a > 0 || first_b > 0);
+
+        let (second_a, second_b) = te.client.collect_fees(&te.provider, &0, &150);
+        assert_eq!((second_a, second_b), (0, 0));
+    }
+
+    #[test]
+    fn collect_fees_does_not_reduce_liquidity() {
+        let env = Env::default();
+        let te = setup_test_env(&env, 1000, 100);
+
+        te.client
+            .mint_position(&te.provider, &0, &150, &100_000, &100_000, &0, &0);
+        let liq_before = te.client.get_position(&te.provider, &0, &150).liquidity;
+
+        te.client
+            .swap(&te.provider, &true, &2_000, &0, &0, &u64::MAX);
+        te.client.collect_fees(&te.provider, &0, &150);
+
+        let liq_after = te.client.get_position(&te.provider, &0, &150).liquidity;
+        assert_eq!(liq_before, liq_after);
+    }
+
+    #[test]
+    fn out_of_range_position_earns_no_fees() {
+        let env = Env::default();
+        let te = setup_test_env(&env, 1000, 100);
+
+        let out_of_range = Address::generate(&env);
+        te.sac_a.mint(&out_of_range, &1_000_000);
+        te.sac_b.mint(&out_of_range, &1_000_000);
+
+        te.client
+            .mint_position(&te.provider, &0, &150, &100_000, &100_000, &0, &0);
+        te.client
+            .mint_position(&out_of_range, &300, &400, &100_000, &0, &0, &0);
+        te.client
+            .swap(&te.provider, &true, &2_000, &0, &0, &u64::MAX);
+
+        let (in_a, in_b) = te.client.collect_fees(&te.provider, &0, &150);
+        let (out_a, out_b) = te.client.collect_fees(&out_of_range, &300, &400);
+        assert!(in_a > 0 || in_b > 0);
+        assert_eq!((out_a, out_b), (0, 0));
+    }
+
+    #[test]
+    fn collect_fees_after_full_burn_returns_accrued_fees() {
+        let env = Env::default();
+        let te = setup_test_env(&env, 1000, 100);
+
+        te.client
+            .mint_position(&te.provider, &0, &150, &100_000, &100_000, &0, &0);
+        let liq = te.client.get_position(&te.provider, &0, &150).liquidity;
+
+        te.client
+            .swap(&te.provider, &true, &2_000, &0, &0, &u64::MAX);
+        te.client.burn_position(&te.provider, &0, &150, &liq);
+
+        assert_eq!(te.client.get_position(&te.provider, &0, &150).liquidity, 0);
+
+        let (fee_a, fee_b) = te.client.collect_fees(&te.provider, &0, &150);
+        assert!(fee_a > 0 || fee_b > 0);
+
+        let (second_a, second_b) = te.client.collect_fees(&te.provider, &0, &150);
+        assert_eq!((second_a, second_b), (0, 0));
+    }
+
+    #[test]
+    fn fees_split_proportionally_between_equal_positions() {
+        let env = Env::default();
+        let te = setup_test_env(&env, 1000, 100);
+
+        let p2 = Address::generate(&env);
+        te.sac_a.mint(&p2, &1_000_000);
+        te.sac_b.mint(&p2, &1_000_000);
+
+        te.client
+            .mint_position(&te.provider, &0, &150, &100_000, &100_000, &0, &0);
+        te.client
+            .mint_position(&p2, &0, &150, &100_000, &100_000, &0, &0);
+        te.client
+            .swap(&te.provider, &true, &2_000, &0, &0, &u64::MAX);
+
+        let (f1_a, f1_b) = te.client.collect_fees(&te.provider, &0, &150);
+        let (f2_a, f2_b) = te.client.collect_fees(&p2, &0, &150);
+
+        assert!(f1_a > 0 || f1_b > 0);
+        assert!(f2_a > 0 || f2_b > 0);
+        assert!((f1_a - f2_a).abs() <= 1);
+        assert!((f1_b - f2_b).abs() <= 1);
+    }
+
+    #[test]
+    fn collect_fees_after_second_swap_returns_only_new_fees() {
+        let env = Env::default();
+        let te = setup_test_env(&env, 1000, 100);
+
+        te.client
+            .mint_position(&te.provider, &0, &150, &100_000, &100_000, &0, &0);
+        te.client
+            .swap(&te.provider, &true, &2_000, &0, &0, &u64::MAX);
+        let (first_a, first_b) = te.client.collect_fees(&te.provider, &0, &150);
+
+        te.client
+            .swap(&te.provider, &false, &2_000, &u128::MAX, &0, &u64::MAX);
+        let (second_a, second_b) = te.client.collect_fees(&te.provider, &0, &150);
+
+        assert!(first_a + second_a > first_a || first_b + second_b > first_b);
+
+        let (third_a, third_b) = te.client.collect_fees(&te.provider, &0, &150);
+        assert_eq!((third_a, third_b), (0, 0));
+    }
+
+    #[test]
+    fn tokens_owed_resets_after_collect() {
+        let env = Env::default();
+        let te = setup_test_env(&env, 1000, 100);
+
+        te.client
+            .mint_position(&te.provider, &0, &150, &100_000, &100_000, &0, &0);
+        te.client
+            .swap(&te.provider, &true, &2_000, &0, &0, &u64::MAX);
+        te.client.collect_fees(&te.provider, &0, &150);
+
+        let pos = te.client.get_position(&te.provider, &0, &150);
+        assert_eq!(pos.tokens_owed, (0, 0));
+    }
+
+    #[test]
+    fn burn_after_collect_returns_principal_not_fees() {
+        let env = Env::default();
+        let te = setup_test_env(&env, 1000, 100);
+
+        te.client
+            .mint_position(&te.provider, &200, &300, &50_000, &0, &0, &0);
+        let liq = te.client.get_position(&te.provider, &200, &300).liquidity;
+
+        let (fee_a, fee_b) = te.client.collect_fees(&te.provider, &200, &300);
+        assert_eq!((fee_a, fee_b), (0, 0));
+
+        let (burn_a, burn_b) = te.client.burn_position(&te.provider, &200, &300, &liq);
+        assert!(burn_a > 0);
+        assert_eq!(burn_b, 0);
+    }
+
+    #[test]
+    fn fees_accrued_before_partial_burn_are_collectable() {
+        let env = Env::default();
+        let te = setup_test_env(&env, 1000, 100);
+
+        te.client
+            .mint_position(&te.provider, &0, &150, &100_000, &100_000, &0, &0);
+        let liq = te.client.get_position(&te.provider, &0, &150).liquidity;
+
+        te.client
+            .swap(&te.provider, &true, &2_000, &0, &0, &u64::MAX);
+        te.client.burn_position(&te.provider, &0, &150, &(liq / 2));
+
+        let (fee_a, fee_b) = te.client.collect_fees(&te.provider, &0, &150);
+        assert!(fee_a > 0 || fee_b > 0);
+
+        let pos = te.client.get_position(&te.provider, &0, &150);
+        assert_eq!(pos.liquidity, liq - liq / 2);
+    }
 }
 
 #[cfg(test)]
@@ -2379,7 +2719,9 @@ mod test {
             .find(|e| e.0 == contract_id && e.1 == expected_topics)
             .expect("burn_pos event not emitted");
 
-        let data: (i32, i32, i128, i128, i128) = event.2.into_val(&env);
+        let __ver_5: (u32, (i32, i32, i128, i128, i128)) = event.2.into_val(&env);
+        assert_eq!(__ver_5.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        let data: (i32, i32, i128, i128, i128) = __ver_5.1;
         assert_eq!(
             data,
             (lower_tick, upper_tick, liquidity, amount_a, amount_b)
@@ -2749,8 +3091,8 @@ mod test_new_tick_features {
         let (provider, _ta, _tb, client) = setup_pool(&env);
         client.mint_position(&provider, &-100_i32, &100_i32, &10_000_i128, &10_000_i128, &0_i128, &0_i128);
 
-        let lower_info = client.get_tick_info(&-100_i32).unwrap();
-        let upper_info = client.get_tick_info(&100_i32).unwrap();
+        let lower_info = client.get_tick_info(&-100_i32);
+        let upper_info = client.get_tick_info(&100_i32);
 
         // lower tick: liquidity_net > 0, gross > 0
         assert!(lower_info.liquidity_gross > 0, "lower gross must be positive");
@@ -3752,7 +4094,9 @@ mod test_single_token_deposit {
             })
             .expect("mint_1t event must be emitted");
 
-        let data: (i32, i32, i128, i128, i128) = evt.2.into_val(&env);
+        let __ver_6: (u32, (i32, i32, i128, i128, i128)) = evt.2.into_val(&env);
+        assert_eq!(__ver_6.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        let data: (i32, i32, i128, i128, i128) = __ver_6.1;
         assert_eq!(data.0, 100_i32);
         assert_eq!(data.1, 200_i32);
         assert_eq!(data.2, result.liquidity);

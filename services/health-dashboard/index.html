@@ -1,0 +1,706 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Soroban AMM — Pool Health Dashboard</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0d1117;
+      --surface:   #161b22;
+      --border:    #30363d;
+      --text:      #e6edf3;
+      --muted:     #8b949e;
+      --accent:    #58a6ff;
+      --green:     #3fb950;
+      --yellow:    #d29922;
+      --red:       #f85149;
+      --radius:    8px;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+
+    header h1 { font-size: 18px; font-weight: 600; }
+
+    #connection-status {
+      font-size: 12px;
+      padding: 4px 10px;
+      border-radius: 12px;
+      background: var(--border);
+      color: var(--muted);
+    }
+    #connection-status.connected { background: #1f4a2e; color: var(--green); }
+    #connection-status.error     { background: #3d1a1a; color: var(--red); }
+
+    main { padding: 24px; max-width: 1400px; margin: 0 auto; }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+    }
+
+    .toolbar label { color: var(--muted); font-size: 13px; }
+
+    input, select, button {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: var(--radius);
+      padding: 6px 12px;
+      font-size: 13px;
+      outline: none;
+    }
+    input:focus, select:focus { border-color: var(--accent); }
+    button {
+      cursor: pointer;
+      background: var(--accent);
+      color: #0d1117;
+      border: none;
+      font-weight: 600;
+      transition: opacity .15s;
+    }
+    button:hover { opacity: .85; }
+    button.secondary {
+      background: var(--surface);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px;
+    }
+
+    .card-title {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+
+    .card-value {
+      font-size: 28px;
+      font-weight: 700;
+      line-height: 1.2;
+    }
+
+    .card-sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+    /* Health score ring */
+    .health-ring-wrap {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+    }
+    .health-ring {
+      width: 80px;
+      height: 80px;
+      position: relative;
+      flex-shrink: 0;
+    }
+    .health-ring svg { transform: rotate(-90deg); }
+    .health-ring text {
+      font-size: 22px;
+      font-weight: 700;
+      fill: var(--text);
+      dominant-baseline: middle;
+      text-anchor: middle;
+      transform: rotate(90deg) translate(0, -80px);
+    }
+    .health-details { flex: 1; }
+    .health-detail-row {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 4px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .health-detail-row span:last-child { color: var(--text); }
+
+    /* Status badge */
+    .badge {
+      display: inline-block;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 10px;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+    .badge-healthy  { background: #1f4a2e; color: var(--green); }
+    .badge-warning  { background: #3d2e00; color: var(--yellow); }
+    .badge-critical { background: #3d1a1a; color: var(--red); }
+
+    /* Deviation bar */
+    .deviation-bar-wrap { margin-top: 8px; }
+    .deviation-label { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+    .deviation-bar {
+      height: 6px;
+      border-radius: 3px;
+      background: var(--border);
+      overflow: hidden;
+    }
+    .deviation-fill {
+      height: 100%;
+      border-radius: 3px;
+      background: var(--green);
+      transition: width .4s;
+    }
+
+    /* Events table */
+    .table-wrap {
+      overflow-x: auto;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      margin-bottom: 24px;
+    }
+    table { width: 100%; border-collapse: collapse; }
+    th {
+      text-align: left;
+      padding: 10px 14px;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      color: var(--muted);
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    td {
+      padding: 10px 14px;
+      font-size: 13px;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: rgba(88,166,255,.05); }
+
+    /* Heatmap */
+    .heatmap-section { margin-bottom: 24px; }
+    .heatmap-section h2 { font-size: 15px; font-weight: 600; margin-bottom: 12px; }
+    .heatmap {
+      display: flex;
+      gap: 3px;
+      align-items: flex-end;
+      height: 80px;
+      padding: 0 2px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px;
+    }
+    .heatmap-bar {
+      flex: 1;
+      border-radius: 2px 2px 0 0;
+      min-height: 4px;
+      transition: height .3s;
+      cursor: pointer;
+      position: relative;
+    }
+    .heatmap-bar:hover::after {
+      content: attr(data-tip);
+      position: absolute;
+      bottom: calc(100% + 6px);
+      left: 50%;
+      transform: translateX(-50%);
+      background: #1f2937;
+      color: var(--text);
+      font-size: 11px;
+      padding: 4px 8px;
+      border-radius: 4px;
+      white-space: nowrap;
+      pointer-events: none;
+      border: 1px solid var(--border);
+    }
+
+    /* Alert panel */
+    .alerts-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px;
+      margin-bottom: 24px;
+    }
+    .alerts-panel h2 { font-size: 15px; font-weight: 600; margin-bottom: 12px; }
+    .alert-form {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 16px;
+    }
+    .alert-list { display: flex; flex-direction: column; gap: 8px; }
+    .alert-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 13px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 8px 12px;
+    }
+    .alert-item .alert-fired { color: var(--red); font-size: 12px; margin-left: auto; }
+    .alert-item button.remove { background: transparent; border: none; color: var(--muted); font-size: 16px; padding: 0 4px; cursor: pointer; }
+    .alert-item button.remove:hover { color: var(--red); }
+
+    /* Price chart placeholder */
+    #price-chart {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      height: 160px;
+      display: flex;
+      align-items: flex-end;
+      padding: 12px;
+      gap: 2px;
+      margin-bottom: 24px;
+      overflow: hidden;
+    }
+
+    .chart-bar {
+      flex: 1;
+      background: var(--accent);
+      opacity: .6;
+      border-radius: 2px 2px 0 0;
+      min-height: 2px;
+      transition: height .3s;
+    }
+
+    .empty-state {
+      color: var(--muted);
+      text-align: center;
+      padding: 40px 0;
+      font-size: 13px;
+    }
+
+    /* Responsive */
+    @media (max-width: 600px) {
+      main { padding: 16px; }
+      .grid-2 { grid-template-columns: 1fr; }
+      .card-value { font-size: 22px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Soroban AMM &mdash; Pool Health Dashboard</h1>
+    <div id="connection-status">Connecting&hellip;</div>
+  </header>
+
+  <main>
+    <div class="toolbar">
+      <label for="api-url">GraphQL API:</label>
+      <input id="api-url" type="text" value="http://localhost:4000" style="width:220px" />
+      <label for="pool-id">Pool ID:</label>
+      <input id="pool-id" type="text" placeholder="pool-demo" style="width:160px" />
+      <button id="btn-refresh">Refresh</button>
+      <button id="btn-auto" class="secondary">Auto-refresh: OFF</button>
+    </div>
+
+    <!-- Key metrics -->
+    <div class="grid-2" id="metrics-grid">
+      <div class="card">
+        <div class="card-title">Total Value Locked</div>
+        <div class="card-value" id="m-tvl">—</div>
+        <div class="card-sub" id="m-tvl-sub">&nbsp;</div>
+      </div>
+      <div class="card">
+        <div class="card-title">24h Volume</div>
+        <div class="card-value" id="m-vol">—</div>
+        <div class="card-sub" id="m-vol-sub">&nbsp;</div>
+      </div>
+      <div class="card">
+        <div class="card-title">24h Fees</div>
+        <div class="card-value" id="m-fees">—</div>
+        <div class="card-sub" id="m-fees-sub">&nbsp;</div>
+      </div>
+      <div class="card">
+        <div class="card-title">Swap Count (all-time)</div>
+        <div class="card-value" id="m-swaps">—</div>
+        <div class="card-sub">&nbsp;</div>
+      </div>
+    </div>
+
+    <!-- Pool health score -->
+    <div class="card" style="margin-bottom:24px" id="health-card">
+      <div class="card-title">Pool Health Score</div>
+      <div class="health-ring-wrap">
+        <div class="health-ring">
+          <svg viewBox="0 0 80 80" width="80" height="80">
+            <circle cx="40" cy="40" r="34" fill="none" stroke="var(--border)" stroke-width="8"/>
+            <circle id="health-arc" cx="40" cy="40" r="34" fill="none"
+              stroke="var(--green)" stroke-width="8"
+              stroke-dasharray="213.6" stroke-dashoffset="213.6"
+              stroke-linecap="round"/>
+            <text x="40" y="40" id="health-score-text">—</text>
+          </svg>
+        </div>
+        <div class="health-details" id="health-details">
+          <div class="health-detail-row"><span>Status</span><span id="hd-status">—</span></div>
+          <div class="health-detail-row"><span>TVL score</span><span id="hd-tvl">—</span></div>
+          <div class="health-detail-row"><span>Volume score</span><span id="hd-vol">—</span></div>
+          <div class="health-detail-row"><span>Fee efficiency</span><span id="hd-fee">—</span></div>
+          <div class="health-detail-row"><span>Price deviation</span><span id="hd-dev">—</span></div>
+        </div>
+      </div>
+
+      <div class="deviation-bar-wrap" style="margin-top:16px">
+        <div class="deviation-label">
+          <span>Price Deviation from TWAP</span>
+          <span id="dev-bps">0 bps</span>
+        </div>
+        <div class="deviation-bar">
+          <div class="deviation-fill" id="dev-fill" style="width:0%"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Liquidity concentration heatmap -->
+    <div class="heatmap-section">
+      <h2>Liquidity Concentration (24h volume by period)</h2>
+      <div class="heatmap" id="heatmap" aria-label="Liquidity concentration heatmap">
+        <div class="empty-state" style="width:100%">Load pool data to see heatmap</div>
+      </div>
+    </div>
+
+    <!-- Price history chart -->
+    <h2 style="font-size:15px;font-weight:600;margin-bottom:12px">Price History (last 30 days)</h2>
+    <div id="price-chart" aria-label="Price history chart">
+      <div class="empty-state" style="width:100%">No price history loaded</div>
+    </div>
+
+    <!-- Alert configuration -->
+    <div class="alerts-panel">
+      <h2>Configurable Alerts</h2>
+      <div class="alert-form">
+        <select id="alert-metric" aria-label="Alert metric">
+          <option value="price_deviation">Price Deviation (bps)</option>
+          <option value="tvl">TVL drop below</option>
+          <option value="volume24h">24h Volume above</option>
+        </select>
+        <input id="alert-threshold" type="number" placeholder="Threshold" min="0" style="width:120px" aria-label="Alert threshold" />
+        <button id="btn-add-alert">Add Alert</button>
+      </div>
+      <div class="alert-list" id="alert-list">
+        <div class="empty-state">No alerts configured for this pool</div>
+      </div>
+    </div>
+
+    <!-- Recent events -->
+    <h2 style="font-size:15px;font-weight:600;margin-bottom:12px">Recent Events</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Type</th>
+            <th>Pool</th>
+            <th>Payload</th>
+          </tr>
+        </thead>
+        <tbody id="events-body">
+          <tr><td colspan="4" class="empty-state">No events loaded</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </main>
+
+  <script>
+    'use strict';
+
+    const $ = id => document.getElementById(id);
+    const CIRCUMFERENCE = 2 * Math.PI * 34; // r=34
+
+    let autoRefreshTimer = null;
+    let autoRefreshOn = false;
+    let alertConfigs = JSON.parse(localStorage.getItem('soroban_alerts') || '[]');
+
+    // ── GraphQL client ──────────────────────────────────────────────────────────
+    async function gql(apiUrl, query, variables = {}) {
+      const res = await fetch(apiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query, variables }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      if (json.errors) throw new Error(json.errors[0].message);
+      return json.data;
+    }
+
+    // ── Formatting helpers ──────────────────────────────────────────────────────
+    function fmt(n) {
+      if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M';
+      if (n >= 1_000)     return (n / 1_000).toFixed(1) + 'K';
+      return n.toFixed(2);
+    }
+
+    function fmtTime(ts) {
+      return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    }
+
+    function statusBadge(status) {
+      return `<span class="badge badge-${status}">${status}</span>`;
+    }
+
+    // ── Render functions ────────────────────────────────────────────────────────
+    function renderStats(stats) {
+      if (!stats || stats.length === 0) return;
+      const s = stats[0];
+      $('m-tvl').textContent = '$' + fmt(s.tvl);
+      $('m-tvl-sub').textContent = `Token A: ${s.tokenA}  /  Token B: ${s.tokenB}`;
+      $('m-vol').textContent = '$' + fmt(s.volume24h);
+      $('m-vol-sub').textContent = `Fee income: $${fmt(s.fees24h)}`;
+      $('m-fees').textContent = '$' + fmt(s.fees24h);
+      $('m-fees-sub').textContent = `Swap count: ${s.swapCount}`;
+      $('m-swaps').textContent = s.swapCount.toLocaleString();
+    }
+
+    function renderHealth(health) {
+      if (!health) return;
+      const score = health.healthScore;
+      const color = score >= 70 ? 'var(--green)' : score >= 40 ? 'var(--yellow)' : 'var(--red)';
+      const offset = CIRCUMFERENCE * (1 - score / 100);
+
+      const arc = $('health-arc');
+      arc.setAttribute('stroke-dashoffset', offset.toFixed(1));
+      arc.setAttribute('stroke', color);
+      $('health-score-text').textContent = score.toFixed(0);
+
+      $('hd-status').innerHTML = statusBadge(health.status);
+      $('hd-tvl').textContent = health.tvlScore.toFixed(1);
+      $('hd-vol').textContent = health.volumeScore.toFixed(1);
+      $('hd-fee').textContent = health.feeEfficiencyScore.toFixed(1);
+      $('hd-dev').textContent = health.priceDeviationBps + ' bps';
+
+      // Deviation bar — clamp at 200bps = 100%
+      const devPct = Math.min(100, health.priceDeviationBps / 2);
+      $('dev-bps').textContent = health.priceDeviationBps + ' bps';
+      const fill = $('dev-fill');
+      fill.style.width = devPct + '%';
+      fill.style.background = health.priceDeviationBps > 100 ? 'var(--red)' : health.priceDeviationBps > 50 ? 'var(--yellow)' : 'var(--green)';
+
+      // Check fired alerts
+      if (health.alertsFired && health.alertsFired.length > 0) {
+        renderFiredAlerts(health.alertsFired);
+      }
+    }
+
+    function renderFiredAlerts(fired) {
+      const list = $('alert-list');
+      fired.forEach(a => {
+        const existing = document.getElementById('fired-' + a.metric);
+        if (existing) return;
+        const div = document.createElement('div');
+        div.className = 'alert-item';
+        div.id = 'fired-' + a.metric;
+        div.innerHTML = `<strong>${a.metric}</strong> exceeded <em>${a.threshold}</em> — current: ${a.currentValue.toFixed(0)} <span class="alert-fired">⚠ ${fmtTime(a.firedAt)}</span>`;
+        list.appendChild(div);
+      });
+    }
+
+    function renderEvents(events) {
+      const tbody = $('events-body');
+      if (!events || events.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="4" class="empty-state">No events</td></tr>';
+        return;
+      }
+      tbody.innerHTML = events.slice(0, 50).map(e => `
+        <tr>
+          <td>${fmtTime(e.timestamp)}</td>
+          <td><span class="badge" style="background:var(--border);color:var(--text)">${e.type}</span></td>
+          <td>${e.poolId}</td>
+          <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;color:var(--muted)">${e.payload}</td>
+        </tr>
+      `).join('');
+    }
+
+    function renderPriceHistory(history) {
+      const chart = $('price-chart');
+      if (!history || history.length === 0) {
+        chart.innerHTML = '<div class="empty-state" style="width:100%">No price history for selected pool</div>';
+        return;
+      }
+      const maxPrice = Math.max(...history.map(p => p.price));
+      const chartHeight = 136; // px available
+      chart.innerHTML = history.map(p => {
+        const h = maxPrice > 0 ? Math.max(2, (p.price / maxPrice) * chartHeight) : 2;
+        return `<div class="chart-bar" style="height:${h}px" title="${p.price.toFixed(6)} @ ${fmtTime(p.timestamp)}"></div>`;
+      }).join('');
+    }
+
+    function renderHeatmap(events) {
+      const heatmap = $('heatmap');
+      if (!events || events.length === 0) {
+        heatmap.innerHTML = '<div class="empty-state" style="width:100%">No volume data</div>';
+        return;
+      }
+      // Bucket events into 24 hourly slots.
+      const buckets = new Array(24).fill(0);
+      const now = Date.now();
+      events.forEach(e => {
+        if (e.type !== 'swap') return;
+        const hoursAgo = Math.floor((now - e.timestamp) / 3_600_000);
+        if (hoursAgo >= 0 && hoursAgo < 24) {
+          const payload = JSON.parse(e.payload || '{}');
+          buckets[23 - hoursAgo] += Number(payload.amountIn || 0);
+        }
+      });
+      const maxBucket = Math.max(...buckets, 1);
+      const colors = ['#1a4a2e','#1f6b40','#3fb950'];
+      heatmap.innerHTML = buckets.map((v, i) => {
+        const pct = v / maxBucket;
+        const h = Math.max(4, pct * 56);
+        const color = pct < 0.3 ? colors[0] : pct < 0.7 ? colors[1] : colors[2];
+        const label = `${23 - i}h ago: ${fmt(v)}`;
+        return `<div class="heatmap-bar" style="height:${h}px;background:${color}" data-tip="${label}" aria-label="${label}"></div>`;
+      }).join('');
+    }
+
+    // ── Alert UI ────────────────────────────────────────────────────────────────
+    function renderAlertConfigs() {
+      const poolId = $('pool-id').value.trim() || 'pool-demo';
+      const list = $('alert-list');
+      const mine = alertConfigs.filter(a => a.poolId === poolId);
+      if (mine.length === 0) {
+        list.innerHTML = '<div class="empty-state">No alerts configured for this pool</div>';
+        return;
+      }
+      list.innerHTML = mine.map((a, idx) => `
+        <div class="alert-item" data-idx="${idx}">
+          <strong>${a.metric}</strong> &gt; <em>${a.thresholdBps}</em>
+          <button class="remove" aria-label="Remove alert" onclick="removeAlert('${poolId}','${a.metric}')">×</button>
+        </div>
+      `).join('');
+    }
+
+    window.removeAlert = function(poolId, metric) {
+      alertConfigs = alertConfigs.filter(a => !(a.poolId === poolId && a.metric === metric));
+      localStorage.setItem('soroban_alerts', JSON.stringify(alertConfigs));
+      renderAlertConfigs();
+      pushAlertToServer(poolId, metric, null);
+    };
+
+    async function pushAlertToServer(poolId, metric, thresholdBps) {
+      const url = $('api-url').value.trim();
+      try {
+        if (thresholdBps === null) {
+          await gql(url, `mutation RemoveAlert($pid:ID!,$m:String!){removeAlertConfig(poolId:$pid,metric:$m)}`, { pid: poolId, m: metric });
+        } else {
+          await gql(url, `mutation SetAlert($pid:ID!,$m:String!,$t:Int!){setAlertConfig(poolId:$pid,metric:$m,thresholdBps:$t){poolId}}`, { pid: poolId, m: metric, t: thresholdBps });
+        }
+      } catch (_) { /* server may be offline — alerts still stored locally */ }
+    }
+
+    $('btn-add-alert').addEventListener('click', () => {
+      const poolId = $('pool-id').value.trim() || 'pool-demo';
+      const metric = $('alert-metric').value;
+      const threshold = parseInt($('alert-threshold').value, 10);
+      if (!metric || isNaN(threshold) || threshold < 0) return;
+      alertConfigs = alertConfigs.filter(a => !(a.poolId === poolId && a.metric === metric));
+      alertConfigs.push({ poolId, metric, thresholdBps: threshold });
+      localStorage.setItem('soroban_alerts', JSON.stringify(alertConfigs));
+      renderAlertConfigs();
+      pushAlertToServer(poolId, metric, threshold);
+      $('alert-threshold').value = '';
+    });
+
+    // ── Main fetch ──────────────────────────────────────────────────────────────
+    async function fetchData() {
+      const apiUrl = $('api-url').value.trim();
+      const rawPoolId = $('pool-id').value.trim();
+      const poolId = rawPoolId || 'pool-demo';
+
+      const status = $('connection-status');
+      status.textContent = 'Loading…';
+      status.className = '';
+
+      try {
+        const QUERY = `
+          query Dashboard($pid: ID!, $pidReq: ID!) {
+            poolStats(poolId: $pid) {
+              poolId tokenA tokenB tvl volume24h fees24h swapCount priceDeviationBps
+            }
+            poolEvents(poolId: $pid, limit: 200) {
+              id poolId type timestamp payload
+            }
+            priceHistory(poolId: $pidReq, from: 0) {
+              poolId timestamp price feeBps
+            }
+            poolHealth(poolId: $pidReq) {
+              healthScore tvlScore volumeScore feeEfficiencyScore
+              priceDeviationBps status
+              alertsFired { poolId metric threshold currentValue firedAt }
+            }
+          }
+        `;
+        const data = await gql(apiUrl, QUERY, { pid: poolId, pidReq: poolId });
+
+        renderStats(data.poolStats);
+        renderHealth(data.poolHealth);
+        renderEvents(data.poolEvents);
+        renderPriceHistory(data.priceHistory);
+        renderHeatmap(data.poolEvents);
+        renderAlertConfigs();
+
+        status.textContent = 'Connected  •  ' + new Date().toLocaleTimeString();
+        status.className = 'connected';
+      } catch (err) {
+        status.textContent = 'Error: ' + err.message;
+        status.className = 'error';
+      }
+    }
+
+    $('btn-refresh').addEventListener('click', fetchData);
+
+    $('btn-auto').addEventListener('click', () => {
+      autoRefreshOn = !autoRefreshOn;
+      $('btn-auto').textContent = 'Auto-refresh: ' + (autoRefreshOn ? 'ON' : 'OFF');
+      $('btn-auto').style.borderColor = autoRefreshOn ? 'var(--green)' : 'var(--border)';
+      if (autoRefreshOn) {
+        fetchData();
+        autoRefreshTimer = setInterval(fetchData, 5000);
+      } else {
+        clearInterval(autoRefreshTimer);
+      }
+    });
+
+    // Initial load.
+    fetchData();
+    renderAlertConfigs();
+  </script>
+</body>
+</html>

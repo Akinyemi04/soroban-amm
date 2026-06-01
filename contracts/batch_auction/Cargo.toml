@@ -1,0 +1,23 @@
+[package]
+name = "batch_auction"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+testutils = [
+    "soroban-sdk/testutils",
+    "amm/testutils",
+    "token/testutils",
+]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+amm = { path = "../amm" }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+amm = { path = "../amm", features = ["testutils"] }
+token = { path = "../token", features = ["testutils"] }

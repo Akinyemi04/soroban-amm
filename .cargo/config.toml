@@ -1,2 +1,11 @@
+[build]
+rustflags = ["-C", "link-arg=-s"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+debug = 0
+panic = "abort"
 [alias]
 wasm = "build --release --target wasm32v1-none"

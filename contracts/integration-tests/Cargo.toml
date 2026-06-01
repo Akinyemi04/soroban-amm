@@ -14,5 +14,8 @@ amm              = { path = "../amm",              features = ["testutils"] }
 token            = { path = "../token",            features = ["testutils"] }
 factory          = { path = "../factory",          features = ["testutils"] }
 twap-consumer    = { path = "../twap_consumer",    features = ["testutils"] }
+twal-consumer    = { path = "../twal_consumer",    features = ["testutils"] }
+dex-aggregator   = { path = "../dex_aggregator",   features = ["testutils"] }
+incentive-campaigns = { path = "../incentive_campaigns", features = ["testutils"] }
 governance       = { path = "../governance",       features = ["testutils"] }
 concentrated_liquidity = { path = "../concentrated_liquidity", features = ["testutils"] }
