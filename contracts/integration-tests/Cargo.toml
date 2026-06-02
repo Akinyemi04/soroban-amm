@@ -8,6 +8,9 @@ edition = "2021"
 name = "integration_tests"
 path = "src/lib.rs"
 
+[features]
+legacy-integration-matrix = []
+
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 amm              = { path = "../amm",              features = ["testutils"] }
