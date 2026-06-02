@@ -298,9 +298,7 @@ impl BatchAuction {
                     &order.amount_in,
                     &order.min_out,
                     &settlement_deadline,
-                    &None::<Address>,
-                )
-                .unwrap_or_else(|_| panic!("order {} swap failed", order_id));
+                );
 
             // Forward output tokens to the original trader.
             SepTokenClient::new(&env, &order.token_out).transfer(

@@ -16,7 +16,7 @@ pub trait ClPoolInterface {
         zero_for_one: bool,
         amount_in: i128,
         sqrt_price_limit_x96: u128,
-    ) -> Result<PriceImpactEstimate, ClError>;
+    ) -> PriceImpactEstimate;
     fn swap(
         env: Env,
         sender: Address,
@@ -25,7 +25,7 @@ pub trait ClPoolInterface {
         sqrt_price_limit_x96: u128,
         min_amount_out: i128,
         deadline: u64,
-    ) -> Result<i128, ClError>;
+    ) -> i128;
 }
 
 #[contracttype]
@@ -44,15 +44,6 @@ pub struct PriceImpactEstimate {
     pub tick_after: i32,
     pub active_liquidity_before: i128,
     pub active_liquidity_after: i128,
-}
-
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[repr(u32)]
-pub enum ClError {
-    ZeroAmounts = 1,
-    DeadlineExpired = 2,
-    Paused = 3,
 }
 
 #[contracterror]
@@ -307,8 +298,7 @@ impl DexAggregator {
             let hop_min = if i == last { min_out } else { 0 };
             current = match hop.pool_kind {
                 PoolKind::Amm => AmmPoolClient::new(env, &hop.pool)
-                    .swap(trader, &hop.token_in, &current, &hop_min, &deadline)
-                    .map_err(|_| AggregatorError::SlippageExceeded)?,
+                    .swap(trader, &hop.token_in, &current, &hop_min, &deadline),
                 PoolKind::Cl => ClPoolClient::new(env, &hop.pool)
                     .swap(
                         trader,
@@ -317,8 +307,7 @@ impl DexAggregator {
                         &0u128,
                         &hop_min,
                         &deadline,
-                    )
-                    .map_err(|_| AggregatorError::SlippageExceeded)?,
+                    ),
             };
         }
         Ok(current)
@@ -345,9 +334,7 @@ impl DexAggregator {
         };
 
         if let Some(pool) = factory.get_pool(token_in, token_out) {
-            let out = AmmPoolClient::new(env, &pool)
-                .get_amount_out(token_in, &amount_in)
-                .unwrap_or(0);
+            let out = AmmPoolClient::new(env, &pool).get_amount_out(token_in, &amount_in);
             if out > best {
                 best = out;
                 hop = RouteHop {
@@ -401,11 +388,10 @@ impl DexAggregator {
         let mut best: i128 = 0;
         let mut zfo = true;
         for direction in [true, false] {
-            if let Ok(est) = client.estimate_price_impact(&direction, &amount_in, &0u128) {
-                if est.amount_out > best {
-                    best = est.amount_out;
-                    zfo = direction;
-                }
+            let est = client.estimate_price_impact(&direction, &amount_in, &0u128);
+            if est.amount_out > best {
+                best = est.amount_out;
+                zfo = direction;
             }
         }
         if best > 0 {

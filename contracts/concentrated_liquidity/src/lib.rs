@@ -12,7 +12,10 @@ use soroban_sdk::{
 };
 
 #[cfg(feature = "testutils")]
-pub const WASM: &[u8] = &[];
+pub const WASM: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../target/wasm32v1-none/release/concentrated_liquidity.wasm"
+));
 
 const PRICE_SCALE: i128 = 1_000_000;
 const TICK_BASE_NUM: i128 = 1_000_100;
@@ -307,7 +310,8 @@ impl ConcentratedLiquidity {
         let oracle: Option<Address> = env
             .storage()
             .instance()
-            .get(&DataKey::OracleAggregator);
+            .get(&DataKey::OracleAggregator)
+            .unwrap_or(None);
         let Some(oracle_addr) = oracle else {
             return Ok(());
         };

@@ -806,7 +806,7 @@ impl AmmPool {
     ///
     /// Any configured signer may call this to initiate or co-sign a proposal.
     /// Once `quorum` approvals are collected the proposal can be executed via
-    /// `execute_multisig_emergency_withdraw`.
+    /// `exec_multisig_emergency_wd`.
     pub fn propose_emergency_withdraw(
         env: Env,
         signer: Address,
@@ -877,7 +877,7 @@ impl AmmPool {
     /// Execute the pending multisig emergency withdrawal once quorum is reached.
     ///
     /// Any signer may call this after enough approvals have been collected.
-    pub fn execute_multisig_emergency_withdraw(
+    pub fn exec_multisig_emergency_wd(
         env: Env,
         signer: Address,
     ) -> Result<(), AmmError> {
@@ -934,6 +934,46 @@ impl AmmPool {
             .instance()
             .set(&DataKey::MultisigProposalApprovals, &soroban_sdk::Vec::<Address>::new(&env));
         soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "ms_ew"), signer), (to, reserve_a, reserve_b));
+        Ok(())
+    }
+
+    fn check_oracle_deviation(
+        env: &Env,
+        token_in: &Address,
+        token_out: &Address,
+        amount_in: i128,
+        amount_out: i128,
+    ) -> Result<(), AmmError> {
+        let oracle: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::OracleAggregator)
+            .unwrap_or(None);
+        let Some(oracle_addr) = oracle else {
+            return Ok(());
+        };
+        let max_dev: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxOracleDeviationBps)
+            .unwrap_or(500);
+
+        let agg = OracleAggregatorClient::new(env, &oracle_addr)
+            .get_price_safe(token_in, token_out);
+        if amount_in <= 0 || agg.confidence == 0 || agg.price <= 0 {
+            return Ok(());
+        }
+
+        let spot_price = amount_out * 1_000_000 / amount_in;
+        let oracle_price = agg.price;
+        let deviation_bps = if spot_price >= oracle_price {
+            (spot_price - oracle_price) * 10_000 / oracle_price
+        } else {
+            (oracle_price - spot_price) * 10_000 / oracle_price
+        };
+        if deviation_bps > max_dev {
+            return Err(AmmError::OracleDeviationExceeded);
+        }
         Ok(())
     }
 
@@ -2843,7 +2883,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_price_ratio(, &None) {
+    fn test_price_ratio() {
         let (env, admin, amm_addr, lp_addr, _) = setup();
 
         let (ta_client, ta_sac) = create_sac(&env, &admin);
@@ -2996,7 +3036,7 @@ pub(crate) mod tests {
         let out = amm.swap(&trader, &ts.tb_addr, &100_000_i128, &0_i128, &u64::MAX);
         assert!(out > 0 && out < 100_000);
 
-        let info = amm.get_info(, &None);
+        let info = amm.get_info();
         assert_eq!(info.reserve_b, 1_100_000);
         assert_eq!(info.reserve_a, 1_000_000 - out);
     }
@@ -3056,7 +3096,7 @@ pub(crate) mod tests {
         ta_sac.mint(&trader, &amount_in);
         let out = amm.swap(&trader, &ts.ta_addr, &amount_in, &0_i128, &u64::MAX);
 
-        let info = amm.get_info(, &None);
+        let info = amm.get_info();
         assert_eq!(info.reserve_a, 1_000_000 + amount_in);
         assert_eq!(info.reserve_b, 1_000_000 - out);
         // k must grow because fee stays in pool
@@ -3207,7 +3247,7 @@ pub(crate) mod tests {
 
         let trader = Address::generate(env);
         ta_sac.mint(&trader, &quoted_in);
-        let actual_in = amm.swap_exact_out(&trader, &ts.tb_addr, &want_out, &quoted_in, &u64::MAX, &None);
+        let actual_in = amm.swap_exact_out(&trader, &ts.tb_addr, &want_out, &quoted_in, &u64::MAX);
 
         assert_eq!(actual_in, quoted_in);
     }
@@ -3301,12 +3341,12 @@ pub(crate) mod tests {
         let lp1 = Address::generate(env);
         ta_sac.mint(&lp1, &1_000_000_i128);
         tb_sac.mint(&lp1, &1_000_000_i128);
-        let shares1 = amm.add_liquidity(&lp1, &1_000_000_i128, &1_000_000_i128, &0_i128, &0_i128, &0_i128, &u64::MAX);
+        let shares1 = amm.add_liquidity(&lp1, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
 
         let lp2 = Address::generate(env);
         ta_sac.mint(&lp2, &500_000_i128);
         tb_sac.mint(&lp2, &500_000_i128);
-        let shares2 = amm.add_liquidity(&lp2, &500_000_i128, &500_000_i128, &0_i128, &0_i128, &0_i128, &u64::MAX);
+        let shares2 = amm.add_liquidity(&lp2, &500_000_i128, &500_000_i128, &0_i128, &u64::MAX);
 
         assert_eq!(amm.get_info().total_shares, shares1 + shares2);
 
@@ -3341,7 +3381,7 @@ pub(crate) mod tests {
 
         let trader = Address::generate(env);
         ta_sac.mint(&trader, &amount_in);
-        let actual = amm.swap(&trader, &ts.ta_addr, &amount_in, &0_i128, &u64::MAX, &None);
+        let actual = amm.swap(&trader, &ts.ta_addr, &amount_in, &0_i128, &u64::MAX);
 
         assert_eq!(quoted, actual);
     }
@@ -3359,7 +3399,7 @@ pub(crate) mod tests {
         let initial_amt = 1_000_000_i128;
         ta_sac.mint(&provider, &initial_amt);
         tb_sac.mint(&provider, &initial_amt);
-        amm.add_liquidity(&provider, &initial_amt, &initial_amt, &0_i128, &0_i128, &0_i128, &u64::MAX);
+        amm.add_liquidity(&provider, &initial_amt, &initial_amt, &0_i128, &u64::MAX);
 
         let info = amm.get_info();
         let initial_k = info.reserve_a * info.reserve_b;
@@ -3373,14 +3413,14 @@ pub(crate) mod tests {
             if i % 2 == 0 {
                 // A -> B
                 ta_sac.mint(&trader, &swap_amt);
-                amm.swap(&trader, &ts.ta_addr, &swap_amt, &0_i128, &u64::MAX, &None);
+                amm.swap(&trader, &ts.ta_addr, &swap_amt, &0_i128, &u64::MAX);
             } else {
                 // B -> A
                 tb_sac.mint(&trader, &swap_amt);
                 amm.swap(&trader, &ts.tb_addr, &swap_amt, &0_i128, &u64::MAX);
             }
 
-            let new_info = amm.get_info(, &None);
+            let new_info = amm.get_info();
             let new_k = new_info.reserve_a * new_info.reserve_b;
 
             // Invariant must hold: new_k >= initial_k
@@ -3481,7 +3521,7 @@ pub(crate) mod tests {
     #[test]
     fn test_swap_emits_token_out_in_event_payload() {
         use soroban_sdk::testutils::Events as _;
-        use soroban_sdk::{symbol_short, IntoVal};
+        use soroban_sdk::IntoVal;
 
         let ts = setup_pool(30);
         let env = &ts.env;
@@ -3509,7 +3549,7 @@ pub(crate) mod tests {
         let swap_event = events
             .iter()
             .find(|e| {
-                e.0 == amm.address && e.1 == (symbol_short!("swap", &None), trader.clone()).into_val(env)
+                e.0 == amm.address && e.1 == (Symbol::new(env, "swap"), trader.clone()).into_val(env)
             })
             .expect("swap event not found");
 
@@ -3559,7 +3599,7 @@ pub(crate) mod tests {
         ta_sac.mint(&trader, &100_000_i128);
         amm.swap(&trader, &ts.ta_addr, &100_000_i128, &0_i128, &u64::MAX);
 
-        // Accumulators should have updated: price (1_000_000, &None) * 10 seconds = 10_000_000
+        // Accumulators should have updated: price 1_000_000 * 10 seconds = 10_000_000
         let (new_cum_a, new_cum_b, new_ts) = amm.get_price_cumulative();
         assert_eq!(new_ts, last_ts + 10);
         assert_eq!(new_cum_a, 10_000_000);
@@ -3577,7 +3617,7 @@ pub(crate) mod tests {
 
         // Perform another swap
         tb_sac.mint(&trader, &50_000_i128);
-        amm.swap(&trader, &ts.tb_addr, &50_000_i128, &0_i128, &u64::MAX, &None);
+        amm.swap(&trader, &ts.tb_addr, &50_000_i128, &0_i128, &u64::MAX);
 
         let (final_cum_a, final_cum_b, final_ts) = amm.get_price_cumulative();
         assert_eq!(final_ts, new_ts + 5);
@@ -3601,11 +3641,8 @@ pub(crate) mod tests {
             &1_000_000_i128,
             &1_000_000_i128,
             &0_i128,
-            &0_i128,
-            &0_i128,
             &u64::MAX,
-        )
-        .unwrap();
+        );
 
         let (cum, last_ts) = amm.get_liquidity_cumulative();
         assert_eq!(cum, 0);
@@ -3614,7 +3651,7 @@ pub(crate) mod tests {
         env.ledger().set_timestamp(last_ts + 10);
         let trader = Address::generate(env);
         ta_sac.mint(&trader, &10_000_i128);
-        amm.swap(&trader, &ts.ta_addr, &10_000_i128, &0_i128, &u64::MAX, &None);
+        amm.swap(&trader, &ts.ta_addr, &10_000_i128, &0_i128, &u64::MAX);
 
         let (new_cum, new_ts) = amm.get_liquidity_cumulative();
         assert_eq!(new_ts, last_ts + 10);
@@ -3663,7 +3700,7 @@ pub(crate) mod tests {
         ta_sac.mint(&trader, &amount_in);
         let out = amm.swap(&trader, &ts.ta_addr, &amount_in, &0_i128, &u64::MAX);
         // fee_bps=0 → no discount; pure constant-product formula
-        let expected = amount_in * 1_000_000 / (1_000_000 + amount_in, &None);
+        let expected = amount_in * 1_000_000 / (1_000_000 + amount_in);
         assert_eq!(out, expected);
     }
 
@@ -3768,7 +3805,7 @@ pub(crate) mod tests {
         ta_sac.mint(&lp2, &500_000_i128);
         tb_sac.mint(&lp2, &1_500_000_i128);
         let shares_minted =
-            amm.add_liquidity(&lp2, &500_000_i128, &1_500_000_i128, &0_i128, &0_i128, &0_i128, &u64::MAX);
+            amm.add_liquidity(&lp2, &500_000_i128, &1_500_000_i128, &0_i128, &u64::MAX);
 
         let shares_from_a = 500_000_i128 * initial_shares / 1_000_000;
         let shares_from_b = 1_500_000_i128 * initial_shares / 2_000_000;
@@ -3887,7 +3924,7 @@ pub(crate) mod tests {
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &large_amount);
         tb_sac.mint(&provider, &large_amount);
-        let shares = amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128, &0_i128, &0_i128, &u64::MAX);
+        let shares = amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128, &u64::MAX);
 
         assert_eq!(shares, large_amount);
         let info = amm.get_info();
@@ -3907,7 +3944,7 @@ pub(crate) mod tests {
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &large_amount);
         tb_sac.mint(&provider, &large_amount);
-        amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128, &0_i128, &0_i128, &u64::MAX);
+        amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128, &u64::MAX);
 
         // amount_in=10^9; numerator = 10^9*9970*4e18 ~ 4e31 < i128::MAX
         let trader = Address::generate(env);
@@ -3919,7 +3956,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_large_reserves_price_ratio_no_overflow() {
-        let ts = setup_pool(30, &None);
+        let ts = setup_pool(30);
         let env = &ts.env;
         let amm = AmmPoolClient::new(env, &ts.amm_addr);
         let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
@@ -3929,7 +3966,7 @@ pub(crate) mod tests {
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &large_amount);
         tb_sac.mint(&provider, &large_amount);
-        amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128, &0_i128, &0_i128, &u64::MAX);
+        amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128, &u64::MAX);
 
         // price_ratio: reserve_b * 1_000_000 / reserve_a; 4e18 * 1e6 = 4e24 < i128::MAX
         let (price_a, price_b) = amm.price_ratio();
@@ -3949,7 +3986,7 @@ pub(crate) mod tests {
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &large_amount);
         tb_sac.mint(&provider, &large_amount);
-        amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128, &0_i128, &0_i128, &u64::MAX);
+        amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128, &u64::MAX);
 
         // Forward: B for A
         let amount_in = 1_000_000_000_i128;
@@ -3981,7 +4018,7 @@ pub(crate) mod tests {
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &large_amount);
         tb_sac.mint(&provider, &large_amount);
-        amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128, &0_i128, &0_i128, &u64::MAX);
+        amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128, &u64::MAX);
 
         // 4e18 * 1e17 * 10000 = 4e39 > i128::MAX
         amm.get_amount_in(&ts.ta_addr, &100_000_000_000_000_000_i128);
@@ -4002,7 +4039,7 @@ pub(crate) mod tests {
         let lp1 = Address::generate(env);
         ta_sac.mint(&lp1, &2_000_000_i128);
         tb_sac.mint(&lp1, &2_000_000_i128);
-        amm.add_liquidity(&lp1, &2_000_000_i128, &2_000_000_i128, &0_i128, &0_i128, &0_i128, &u64::MAX);
+        amm.add_liquidity(&lp1, &2_000_000_i128, &2_000_000_i128, &0_i128, &u64::MAX);
 
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &1_000_000_i128);
@@ -4054,7 +4091,7 @@ pub(crate) mod tests {
         let lp1 = Address::generate(env);
         ta_sac.mint(&lp1, &2_000_000_i128);
         tb_sac.mint(&lp1, &2_000_000_i128);
-        amm.add_liquidity(&lp1, &2_000_000_i128, &2_000_000_i128, &0_i128, &0_i128, &0_i128, &u64::MAX);
+        amm.add_liquidity(&lp1, &2_000_000_i128, &2_000_000_i128, &0_i128, &u64::MAX);
 
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &1_000_000_i128);
@@ -4134,7 +4171,10 @@ mod prop_tests {
     use super::tests::*;
     use super::*;
     use proptest::prelude::*;
-    use soroban_sdk::{testutils::Address as _, Address, Bytes, Env};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        Address, Bytes, Env,
+    };
 
     proptest! {
         /// Property 1: For any valid first deposit, initial shares (sqrt(a*b)) are always positive.
@@ -4364,8 +4404,8 @@ mod prop_tests {
          assert_eq!(ta_client.balance(&recipient), 2_000_000);
          assert_eq!(tb_client.balance(&recipient), 1_000_000);
 
-         // Verify audit log values in contract storage using env.as_contract_at
-         env.as_contract_at(&amm_addr, || {
+         // Verify audit log values in contract storage from the contract context.
+         env.as_contract(&amm_addr, || {
              let ts: u64 = env.storage().instance().get(&DataKey::EmergencyWithdrawTimestamp).unwrap();
              let rec: Address = env.storage().instance().get(&DataKey::EmergencyWithdrawRecipient).unwrap();
              assert_eq!(ts, expected_ts);
@@ -4911,8 +4951,6 @@ mod prop_tests {
             &provider,
             &1_000_000_i128,
             &1_000_000_i128,
-            &0_i128,
-            &0_i128,
             &0_i128,
             &u64::MAX,
         );

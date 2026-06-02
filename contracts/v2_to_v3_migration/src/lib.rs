@@ -200,9 +200,8 @@ impl MigrationContract {
         let token_b = pool_info.token_b.clone();
 
         // Remove liquidity from V2; tokens land in provider's wallet.
-        let (received_a, received_b) = v2_client
-            .remove_liquidity(&provider, &v2_shares, &min_a, &min_b, &deadline)
-            .map_err(|_| MigrationError::MigrationFailed)?;
+        let (received_a, received_b) =
+            v2_client.remove_liquidity(&provider, &v2_shares, &min_a, &min_b, &deadline);
 
         // ── Step 2: compute optimal V3 tick range ────────────────────────────
         let v3_client = V3PoolClient::new(&env, &v3_pool);
@@ -222,18 +221,16 @@ impl MigrationContract {
         ta_client.approve(&contract_addr, &v3_pool, &received_a, &200u32);
         tb_client.approve(&contract_addr, &v3_pool, &received_b, &200u32);
 
-        let position_id = v3_client
-            .add_liquidity_range(
-                &contract_addr,
-                &received_a,
-                &received_b,
-                &final_tick_lower,
-                &final_tick_upper,
-                &min_v3_shares,
-                &deadline,
-                &true, // fee_discount: migration incentive
-            )
-            .map_err(|_| MigrationError::MigrationFailed)?;
+        let position_id = v3_client.add_liquidity_range(
+            &contract_addr,
+            &received_a,
+            &received_b,
+            &final_tick_lower,
+            &final_tick_upper,
+            &min_v3_shares,
+            &deadline,
+            &true, // fee_discount: migration incentive
+        );
 
         // ── Step 4: refund leftover dust to provider ──────────────────────────
         let refund_a = ta_client.balance(&contract_addr);

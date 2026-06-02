@@ -9,28 +9,40 @@ use amm::AmmPoolClient;
 
 #[contracttype]
 #[derive(Clone, Debug)]
+pub struct SwapOp {
+    pub pool: Address,
+    pub token_in: Address,
+    pub amount_in: i128,
+    pub min_out: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AddLiquidityOp {
+    pub pool: Address,
+    pub amount_a: i128,
+    pub amount_b: i128,
+    pub min_shares: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RemoveLiquidityOp {
+    pub pool: Address,
+    pub shares: i128,
+    pub min_a: i128,
+    pub min_b: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
 pub enum BatchOp {
     /// Swap `amount_in` of `token_in` on `pool` with `min_out` slippage guard.
-    Swap {
-        pool: Address,
-        token_in: Address,
-        amount_in: i128,
-        min_out: i128,
-    },
+    Swap(SwapOp),
     /// Add liquidity to `pool`.
-    AddLiquidity {
-        pool: Address,
-        amount_a: i128,
-        amount_b: i128,
-        min_shares: i128,
-    },
+    AddLiquidity(AddLiquidityOp),
     /// Remove liquidity from `pool`.
-    RemoveLiquidity {
-        pool: Address,
-        shares: i128,
-        min_a: i128,
-        min_b: i128,
-    },
+    RemoveLiquidity(RemoveLiquidityOp),
 }
 
 #[contract]
@@ -76,40 +88,35 @@ impl BatchRouter {
 
     fn execute_op(env: &Env, caller: &Address, op: &BatchOp, deadline: u64) -> i128 {
         match op {
-            BatchOp::Swap {
-                pool,
-                token_in,
-                amount_in,
-                min_out,
-            } => {
-                let out = AmmPoolClient::new(env, pool)
-                    .swap(caller, token_in, amount_in, min_out, &deadline, &None)
-                    .unwrap_or_else(|_| panic!("batch swap failed"));
-                out
+            BatchOp::Swap(op) => {
+                AmmPoolClient::new(env, &op.pool).swap(
+                    caller,
+                    &op.token_in,
+                    &op.amount_in,
+                    &op.min_out,
+                    &deadline,
+                )
             }
-            BatchOp::AddLiquidity {
-                pool,
-                amount_a,
-                amount_b,
-                min_shares,
-            } => {
-                let shares = AmmPoolClient::new(env, pool)
-                    .add_liquidity(caller, amount_a, amount_b, min_shares, &deadline)
-                    .unwrap_or_else(|_| panic!("batch add_liquidity failed"));
-                shares
+            BatchOp::AddLiquidity(op) => {
+                AmmPoolClient::new(env, &op.pool).add_liquidity(
+                    caller,
+                    &op.amount_a,
+                    &op.amount_b,
+                    &op.min_shares,
+                    &deadline,
+                )
             }
-            BatchOp::RemoveLiquidity {
-                pool,
-                shares,
-                min_a,
-                min_b,
-            } => {
-                let (a, b) = AmmPoolClient::new(env, pool)
-                    .remove_liquidity(caller, shares, min_a, min_b, &deadline)
-                    .unwrap_or_else(|_| panic!("batch remove_liquidity failed"));
+            BatchOp::RemoveLiquidity(op) => {
+                let (a, b) = AmmPoolClient::new(env, &op.pool).remove_liquidity(
+                    caller,
+                    &op.shares,
+                    &op.min_a,
+                    &op.min_b,
+                    &deadline,
+                );
                 // Pack both legs into one i128 result is lossy; return shares burned as marker.
                 let _ = (a, b);
-                *shares
+                op.shares
             }
         }
     }
@@ -184,24 +191,24 @@ mod tests {
 
         let ops = vec![
             &env,
-            BatchOp::Swap {
+            BatchOp::Swap(SwapOp {
                 pool: pool.clone(),
                 token_in: ta.clone(),
                 amount_in: 10_000_i128,
                 min_out: 0_i128,
-            },
-            BatchOp::Swap {
+            }),
+            BatchOp::Swap(SwapOp {
                 pool: pool.clone(),
                 token_in: tb.clone(),
                 amount_in: 5_000_i128,
                 min_out: 0_i128,
-            },
-            BatchOp::Swap {
+            }),
+            BatchOp::Swap(SwapOp {
                 pool: pool.clone(),
                 token_in: ta.clone(),
                 amount_in: 3_000_i128,
                 min_out: 0_i128,
-            },
+            }),
         ];
 
         let deadline = env.ledger().timestamp() + 1000;
@@ -228,24 +235,23 @@ mod tests {
             &50_000_i128,
             &0_i128,
             &u64::MAX,
-            &None,
         );
 
         let tb_bal = StellarTokenClient::new(&env, &tb).balance(&trader);
         let ops = vec![
             &env,
-            BatchOp::Swap {
+            BatchOp::Swap(SwapOp {
                 pool: pool.clone(),
                 token_in: ta.clone(),
                 amount_in: 10_000_i128,
                 min_out: 0_i128,
-            },
-            BatchOp::AddLiquidity {
+            }),
+            BatchOp::AddLiquidity(AddLiquidityOp {
                 pool: pool.clone(),
                 amount_a: 5_000_i128,
                 amount_b: tb_bal / 10,
                 min_shares: 0_i128,
-            },
+            }),
         ];
 
         let batch_addr = env.register_contract(None, BatchRouter);
@@ -271,18 +277,18 @@ mod tests {
 
         let ops = vec![
             &env,
-            BatchOp::Swap {
+            BatchOp::Swap(SwapOp {
                 pool: pool.clone(),
                 token_in: ta.clone(),
                 amount_in: 1_000_i128,
                 min_out: 0_i128,
-            },
-            BatchOp::Swap {
+            }),
+            BatchOp::Swap(SwapOp {
                 pool,
                 token_in: tb,
                 amount_in: 1_000_i128,
                 min_out: 10_000_000_i128,
-            },
+            }),
         ];
 
         let batch_addr = env.register_contract(None, BatchRouter);

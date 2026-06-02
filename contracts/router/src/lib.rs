@@ -71,7 +71,6 @@ impl Router {
                 &current_amount,
                 &hop_min_out,
                 &deadline,
-                &None,
             );
         }
 
