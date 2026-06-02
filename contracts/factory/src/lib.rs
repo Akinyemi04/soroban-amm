@@ -27,6 +27,7 @@ pub enum FactoryError {
     Unauthorized = 6,
     FeeNotConfigured = 7,
     RateLimitExceeded = 8,
+    CreationPaused = 9,
 }
 
 #[contractclient(name = "ClPoolClient")]
@@ -116,6 +117,7 @@ pub enum DataKey {
     Treasury,                       // Address — protocol treasury for fee sweeps
     GlobalProtocolFeeBps,           // i128 — global protocol fee rate (0 = off)
     PoolTokens(Address),            // pool address → (token_a, token_b) for sweep forwarding
+    CreationPaused,                 // bool — true blocks new V2 and CL pool creation
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -201,6 +203,7 @@ impl Factory {
         fee_tier: i128,
         governance_wasm_hash: Option<BytesN<32>>,
     ) -> Result<(Address, Option<Address>), FactoryError> {
+        Self::ensure_creation_unpaused(&env)?;
         let fee_bps = fee_tier_to_bps(fee_tier)?;
         Self::create_pool_with_fee_bps(env, caller, token_a, token_b, fee_bps, governance_wasm_hash)
     }
@@ -219,6 +222,7 @@ impl Factory {
         fee_bps: i128,
         governance_wasm_hash: Option<BytesN<32>>,
     ) -> Result<(Address, Option<Address>), FactoryError> {
+        Self::ensure_creation_unpaused(&env)?;
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         let permissionless: bool = env
             .storage()
@@ -441,6 +445,34 @@ impl Factory {
         Ok(())
     }
 
+    /// Pause all new V2 and concentrated-liquidity pool creation. Admin-only.
+    pub fn pause_creation(env: Env, admin: Address) -> Result<(), FactoryError> {
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::CreationPaused, &true);
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "creation_paused"),),
+            (admin,)
+        );
+        Ok(())
+    }
+
+    /// Resume V2 and concentrated-liquidity pool creation. Admin-only.
+    pub fn unpause_creation(env: Env, admin: Address) -> Result<(), FactoryError> {
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::CreationPaused, &false);
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "creation_unpaused"),),
+            (admin,)
+        );
+        Ok(())
+    }
+
     /// Deploy a new concentrated liquidity pool for `(token_a, token_b)` at `fee_bps`.
     ///
     /// A given (token_a, token_b, fee_bps) triplet is unique — the same pair can have
@@ -459,6 +491,7 @@ impl Factory {
         fee_bps: i128,
         initial_tick: i32,
     ) -> Result<Address, FactoryError> {
+        Self::ensure_creation_unpaused(&env)?;
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         let permissionless: bool = env
             .storage()
@@ -609,6 +642,11 @@ impl Factory {
             .instance()
             .get(&DataKey::PermissionlessMode)
             .unwrap_or(false)
+    }
+
+    /// Return whether new V2 and CL pool creation is currently paused.
+    pub fn is_creation_paused(env: Env) -> bool {
+        Self::creation_paused(&env)
     }
 
     /// Return the current pool creation fee `(fee_token, fee_amount)`, or `None` if unset.
@@ -985,6 +1023,29 @@ impl Factory {
             .get(&DataKey::AllPools)
             .unwrap_or_else(|| Vec::new(env));
         all.len()
+    }
+
+    fn require_admin(env: &Env, admin: &Address) -> Result<(), FactoryError> {
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if *admin != stored_admin {
+            return Err(FactoryError::Unauthorized);
+        }
+        admin.require_auth();
+        Ok(())
+    }
+
+    fn creation_paused(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::CreationPaused)
+            .unwrap_or(false)
+    }
+
+    fn ensure_creation_unpaused(env: &Env) -> Result<(), FactoryError> {
+        if Self::creation_paused(env) {
+            return Err(FactoryError::CreationPaused);
+        }
+        Ok(())
     }
 
     fn sync_global_fee_page(
@@ -1388,6 +1449,68 @@ mod tests {
 
         // Partial update — only amm_wasm_hash.
         factory.update_wasm_hashes(&Some(amm_hash.clone()), &None);
+    }
+
+    // ── Issue #298: factory-level emergency creation pause ───────────────────
+
+    #[test]
+    fn test_creation_pause_blocks_pool_creation_then_resumes() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+        let admin = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+
+        assert!(!factory.is_creation_paused());
+
+        factory.pause_creation(&admin);
+        assert!(factory.is_creation_paused());
+
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+        let result = factory.try_create_pool_with_fee_bps(&admin, &ta, &tb, &30_i128, &None);
+        assert_eq!(result, Err(Ok(FactoryError::CreationPaused)));
+        assert_eq!(factory.all_pools().len(), 0);
+
+        factory.unpause_creation(&admin);
+        assert!(!factory.is_creation_paused());
+
+        let (pool, gov) = factory.create_pool_with_fee_bps(&admin, &ta, &tb, &30_i128, &None);
+        assert_eq!(factory.get_pool(&ta, &tb), Some(pool));
+        assert_eq!(gov, None);
+    }
+
+    #[test]
+    fn test_creation_pause_blocks_cl_pool_creation() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+        let cl_hash = env
+            .deployer()
+            .upload_contract_wasm(concentrated_liquidity::WASM);
+
+        let admin = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+        factory.set_cl_wasm_hash(&cl_hash);
+
+        factory.pause_creation(&admin);
+
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+        let result = factory.try_create_cl_pool(&admin, &ta, &tb, &30_i128, &0_i32);
+        assert_eq!(result, Err(Ok(FactoryError::CreationPaused)));
+        assert_eq!(factory.get_cl_pool(&ta, &tb, &30_i128), None);
     }
 
     // ── Issue #182: CL pool creation ──────────────────────────────────────────
