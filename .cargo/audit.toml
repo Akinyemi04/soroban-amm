@@ -1,3 +1,2 @@
-[[ignore]]
-id = "RUSTSEC-2024-0436"
-reason = "paste is a transitive dependency; the unmaintained advisory carries no security impact for this project"
+[advisories]
+ignore = ["RUSTSEC-2024-0436"]
