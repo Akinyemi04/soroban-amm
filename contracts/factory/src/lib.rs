@@ -1834,7 +1834,7 @@ mod tests {
 
         let ta = Address::generate(&env);
         let tb = Address::generate(&env);
-        let (pool, _) = factory.create_pool_with_fee_bps(&user, &ta, &tb, &30_i128, &None);
+        let (_pool, _) = factory.create_pool_with_fee_bps(&user, &ta, &tb, &30_i128, &None);
 
         assert!(factory.get_pool(&ta, &tb).is_some());
         // Fee transferred from user to admin (treasury).
@@ -2090,7 +2090,7 @@ mod tests {
         factory.set_treasury(&admin, &treasury, &10_i128);
 
         // Seed the pool with liquidity so swaps work.
-        let lp_addr = factory.get_lp_token(&pool_addr).unwrap();
+        let _lp_addr = factory.get_lp_token(&pool_addr).unwrap();
         token::LpTokenClient::new(&env, &ta_addr).mint(&admin, &10_000_000_i128);
         token::LpTokenClient::new(&env, &tb_addr).mint(&admin, &10_000_000_i128);
         let amm = amm::AmmPoolClient::new(&env, &pool_addr);
