@@ -29,6 +29,7 @@ pub enum NftError {
     TokenNotFound      = 3,
     NotOwnerOrApproved = 4,
     InvalidReceiver    = 5,
+    InvalidTtlConfig   = 6,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -52,6 +53,12 @@ pub enum DataKey {
     TokenPosition(u64),
     /// All token ids owned by an address: `OwnedTokens(owner) → Vec<u64>`. Persistent.
     OwnedTokens(Address),
+    /// Admin-tunable TTL bump threshold (in ledgers) for persistent entries.
+    /// Instance storage; falls back to [`ClPositionNft::DEFAULT_MIN_TTL`].
+    TtlMinThreshold,
+    /// Admin-tunable TTL bump target (in ledgers) for persistent entries.
+    /// Instance storage; falls back to [`ClPositionNft::DEFAULT_BUMP_TO`].
+    TtlBumpTo,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -73,6 +80,22 @@ pub struct ClPositionNft;
 
 #[contractimpl]
 impl ClPositionNft {
+    // ── TTL configuration ─────────────────────────────────────────────────────
+    //
+    // Persistent entries are evicted by the network once their TTL lapses
+    // (~30 days at 5 s/ledger under the default window). A long-lived position
+    // NFT — e.g. the receipt for a 90-day range order — would silently vanish
+    // if nobody interacts with it before then. To prevent that, every read or
+    // write of a persistent entry bumps its TTL back up. See issue #353.
+
+    /// Default bump threshold: only extend when the entry has fewer than this
+    /// many ledgers of life left (~30 days at 5 s/ledger). Avoids redundant
+    /// bumps on every access.
+    pub const DEFAULT_MIN_TTL: u32 = 518_400;
+    /// Default bump target: extend the entry's life to this many ledgers
+    /// (~180 days at 5 s/ledger).
+    pub const DEFAULT_BUMP_TO: u32 = 3_110_400;
+
     // ── One-time setup ────────────────────────────────────────────────────────
 
     /// Registers the admin and the CL pool address permitted to mint/burn.
@@ -84,6 +107,7 @@ impl ClPositionNft {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::ClPool, &cl_pool);
         env.storage().instance().set(&DataKey::NextTokenId, &0_u64);
+        Self::bump_instance(&env);
         Ok(())
     }
 
@@ -97,6 +121,37 @@ impl ClPositionNft {
             .ok_or(NftError::Unauthorized)?;
         pool.require_auth();
         Ok(pool)
+    }
+
+    /// Returns the active `(min_ttl_threshold, bump_to)` pair, using the admin
+    /// overrides if set and the compiled defaults otherwise.
+    fn ttl_config(env: &Env) -> (u32, u32) {
+        let min_ttl = env
+            .storage()
+            .instance()
+            .get(&DataKey::TtlMinThreshold)
+            .unwrap_or(Self::DEFAULT_MIN_TTL);
+        let bump_to = env
+            .storage()
+            .instance()
+            .get(&DataKey::TtlBumpTo)
+            .unwrap_or(Self::DEFAULT_BUMP_TO);
+        (min_ttl, bump_to)
+    }
+
+    /// Extends the TTL of a persistent `key` so it is not evicted while in use.
+    /// Safe to call on every access — `extend_ttl` is a no-op until the entry
+    /// drops below the threshold.
+    fn bump_persistent(env: &Env, key: &DataKey) {
+        let (min_ttl, bump_to) = Self::ttl_config(env);
+        env.storage().persistent().extend_ttl(key, min_ttl, bump_to);
+    }
+
+    /// Extends the TTL of the contract's instance storage (admin, pool, id
+    /// counter, TTL config) so global state survives alongside the positions.
+    fn bump_instance(env: &Env) {
+        let (min_ttl, bump_to) = Self::ttl_config(env);
+        env.storage().instance().extend_ttl(min_ttl, bump_to);
     }
 
     // ── Core lifecycle ────────────────────────────────────────────────────────
@@ -126,9 +181,9 @@ impl ClPositionNft {
             .set(&DataKey::NextTokenId, &(token_id + 1));
 
         // Store owner (persistent).
-        env.storage()
-            .persistent()
-            .set(&DataKey::Owner(token_id), &to);
+        let owner_key = DataKey::Owner(token_id);
+        env.storage().persistent().set(&owner_key, &to);
+        Self::bump_persistent(&env, &owner_key);
 
         // Store position metadata (persistent).
         let meta = PositionMeta {
@@ -136,9 +191,9 @@ impl ClPositionNft {
             lower_tick,
             upper_tick,
         };
-        env.storage()
-            .persistent()
-            .set(&DataKey::TokenPosition(token_id), &meta);
+        let pos_key = DataKey::TokenPosition(token_id);
+        env.storage().persistent().set(&pos_key, &meta);
+        Self::bump_persistent(&env, &pos_key);
 
         // Append to the owner's token list (persistent).
         let list_key = DataKey::OwnedTokens(to.clone());
@@ -149,6 +204,8 @@ impl ClPositionNft {
             .unwrap_or_else(|| Vec::new(&env));
         owned.push_back(token_id);
         env.storage().persistent().set(&list_key, &owned);
+        Self::bump_persistent(&env, &list_key);
+        Self::bump_instance(&env);
 
         // Emit mint event: topic=(nft_mint, to), data=token_id.
         env.events()
@@ -191,7 +248,10 @@ impl ClPositionNft {
         if let Some(idx) = owned.iter().position(|id| id == token_id) {
             owned.remove(idx as u32);
             env.storage().persistent().set(&list_key, &owned);
+            Self::bump_persistent(&env, &list_key);
         }
+
+        Self::bump_instance(&env);
 
         // Emit burn event: topic=(nft_burn, owner), data=token_id.
         env.events()
@@ -204,26 +264,38 @@ impl ClPositionNft {
 
     /// Returns the owner of `token_id`, or [`NftError::TokenNotFound`].
     pub fn owner_of(env: Env, token_id: u64) -> Result<Address, NftError> {
-        env.storage()
+        let key = DataKey::Owner(token_id);
+        let owner: Address = env
+            .storage()
             .persistent()
-            .get(&DataKey::Owner(token_id))
-            .ok_or(NftError::TokenNotFound)
+            .get(&key)
+            .ok_or(NftError::TokenNotFound)?;
+        Self::bump_persistent(&env, &key);
+        Ok(owner)
     }
 
     /// Returns the [`PositionMeta`] for `token_id`, or [`NftError::TokenNotFound`].
     pub fn position_meta(env: Env, token_id: u64) -> Result<PositionMeta, NftError> {
-        env.storage()
+        let key = DataKey::TokenPosition(token_id);
+        let meta: PositionMeta = env
+            .storage()
             .persistent()
-            .get(&DataKey::TokenPosition(token_id))
-            .ok_or(NftError::TokenNotFound)
+            .get(&key)
+            .ok_or(NftError::TokenNotFound)?;
+        Self::bump_persistent(&env, &key);
+        Ok(meta)
     }
 
     /// Returns all token ids owned by `owner` (empty vec if none).
     pub fn tokens_of(env: Env, owner: Address) -> Vec<u64> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::OwnedTokens(owner))
-            .unwrap_or_else(|| Vec::new(&env))
+        let key = DataKey::OwnedTokens(owner);
+        match env.storage().persistent().get::<_, Vec<u64>>(&key) {
+            Some(owned) => {
+                Self::bump_persistent(&env, &key);
+                owned
+            }
+            None => Vec::new(&env),
+        }
     }
 
     /// Returns the number of tokens owned by `owner`.
@@ -244,11 +316,13 @@ impl ClPositionNft {
         token_id: u64,
     ) -> Result<(), NftError> {
         caller.require_auth();
+        let owner_key = DataKey::Owner(token_id);
         let owner: Address = env
             .storage()
             .persistent()
-            .get(&DataKey::Owner(token_id))
+            .get(&owner_key)
             .ok_or(NftError::TokenNotFound)?;
+        Self::bump_persistent(&env, &owner_key);
 
         let is_owner = caller == owner;
         let is_operator = Self::is_approved_for_all(env.clone(), owner.clone(), caller.clone());
@@ -256,9 +330,9 @@ impl ClPositionNft {
             return Err(NftError::Unauthorized);
         }
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Approved(token_id), &approved);
+        let approved_key = DataKey::Approved(token_id);
+        env.storage().persistent().set(&approved_key, &approved);
+        Self::bump_persistent(&env, &approved_key);
 
         env.events()
             .publish((soroban_sdk::Symbol::new(&env, "approve"), caller, approved), token_id);
@@ -274,19 +348,23 @@ impl ClPositionNft {
         approved: bool,
     ) {
         owner.require_auth();
-        env.storage()
-            .persistent()
-            .set(&DataKey::OperatorApproval(owner.clone(), operator.clone()), &approved);
+        let key = DataKey::OperatorApproval(owner.clone(), operator.clone());
+        env.storage().persistent().set(&key, &approved);
+        Self::bump_persistent(&env, &key);
         env.events()
             .publish((soroban_sdk::Symbol::new(&env, "approval_for_all"), owner, operator), approved);
     }
 
     /// Check if `operator` is approved for all tokens of `owner`.
     pub fn is_approved_for_all(env: Env, owner: Address, operator: Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::OperatorApproval(owner, operator))
-            .unwrap_or(false)
+        let key = DataKey::OperatorApproval(owner, operator);
+        match env.storage().persistent().get::<_, bool>(&key) {
+            Some(approved) => {
+                Self::bump_persistent(&env, &key);
+                approved
+            }
+            None => false,
+        }
     }
 
     /// Transfer `token_id` from `from` to `to`.
@@ -300,10 +378,11 @@ impl ClPositionNft {
     ) -> Result<(), NftError> {
         caller.require_auth();
 
+        let owner_key = DataKey::Owner(token_id);
         let owner: Address = env
             .storage()
             .persistent()
-            .get(&DataKey::Owner(token_id))
+            .get(&owner_key)
             .ok_or(NftError::TokenNotFound)?;
 
         if owner != from {
@@ -319,7 +398,8 @@ impl ClPositionNft {
         }
 
         // Update Owner
-        env.storage().persistent().set(&DataKey::Owner(token_id), &to);
+        env.storage().persistent().set(&owner_key, &to);
+        Self::bump_persistent(&env, &owner_key);
 
         // Clear Approved
         env.storage().persistent().remove(&DataKey::Approved(token_id));
@@ -334,6 +414,7 @@ impl ClPositionNft {
         if let Some(idx) = from_owned.iter().position(|id| id == token_id) {
             from_owned.remove(idx as u32);
             env.storage().persistent().set(&from_key, &from_owned);
+            Self::bump_persistent(&env, &from_key);
         }
 
         // Update to OwnedTokens
@@ -345,6 +426,7 @@ impl ClPositionNft {
             .unwrap_or_else(|| Vec::new(&env));
         to_owned.push_back(token_id);
         env.storage().persistent().set(&to_key, &to_owned);
+        Self::bump_persistent(&env, &to_key);
 
         // Emit transfer event
         env.events()
@@ -355,7 +437,12 @@ impl ClPositionNft {
 
     /// Returns the currently-approved address for `token_id`, if any.
     pub fn get_approved(env: Env, token_id: u64) -> Option<Address> {
-        env.storage().persistent().get(&DataKey::Approved(token_id))
+        let key = DataKey::Approved(token_id);
+        let approved: Option<Address> = env.storage().persistent().get(&key);
+        if approved.is_some() {
+            Self::bump_persistent(&env, &key);
+        }
+        approved
     }
 
     /// Returns the registered admin address.
@@ -374,6 +461,33 @@ impl ClPositionNft {
             .instance()
             .get(&DataKey::NextTokenId)
             .unwrap_or(0)
+    }
+
+    /// Returns the active persistent-entry TTL parameters
+    /// `(min_ttl_threshold, bump_to)`, in ledgers.
+    pub fn ttl_params(env: Env) -> (u32, u32) {
+        Self::ttl_config(&env)
+    }
+
+    /// Admin-only: tune the persistent-entry TTL parameters (in ledgers).
+    /// `bump_to` must be at least `min_ttl_threshold`, otherwise the bump could
+    /// never raise an entry above the threshold.
+    pub fn set_ttl_params(env: Env, min_ttl_threshold: u32, bump_to: u32) -> Result<(), NftError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(NftError::Unauthorized)?;
+        admin.require_auth();
+        if bump_to < min_ttl_threshold {
+            return Err(NftError::InvalidTtlConfig);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::TtlMinThreshold, &min_ttl_threshold);
+        env.storage().instance().set(&DataKey::TtlBumpTo, &bump_to);
+        Self::bump_instance(&env);
+        Ok(())
     }
 }
 
@@ -664,5 +778,81 @@ mod tests {
 
         let res = client.try_transfer(&user_a, &user_b, &user_b, &id);
         assert_eq!(res.unwrap_err().unwrap(), NftError::Unauthorized);
+    }
+
+    // ── TTL configuration (#353) ───────────────────────────────────────────────
+
+    #[test]
+    fn ttl_params_default_to_constants() {
+        let (_env, client, _admin, _pool, _) = setup();
+        let (min_ttl, bump_to) = client.ttl_params();
+        assert_eq!(min_ttl, ClPositionNft::DEFAULT_MIN_TTL);
+        assert_eq!(bump_to, ClPositionNft::DEFAULT_BUMP_TO);
+    }
+
+    #[test]
+    fn admin_can_tune_ttl_params() {
+        let (_env, client, _admin, _pool, _) = setup();
+        client.set_ttl_params(&100_000, &900_000);
+        let (min_ttl, bump_to) = client.ttl_params();
+        assert_eq!(min_ttl, 100_000);
+        assert_eq!(bump_to, 900_000);
+    }
+
+    #[test]
+    fn set_ttl_params_rejects_bump_below_threshold() {
+        let (_env, client, _admin, _pool, _) = setup();
+        let err = client.try_set_ttl_params(&900_000, &100_000).unwrap_err().unwrap();
+        assert_eq!(err, NftError::InvalidTtlConfig);
+    }
+
+    #[test]
+    #[should_panic]
+    fn set_ttl_params_requires_admin_auth() {
+        let env = Env::default();
+        let contract_id = env.register(ClPositionNft, ());
+        let client = ClPositionNftClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let pool = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialize(&admin, &pool);
+
+        // Strip auth: admin.require_auth() must fail.
+        env.set_auths(&[]);
+        client.set_ttl_params(&100_000, &900_000);
+    }
+
+    /// Accessing a position after a long ledger advance keeps re-bumping its
+    /// TTL, so reads and writes still succeed far beyond the default eviction
+    /// window instead of trapping on an evicted entry.
+    #[test]
+    fn access_keeps_position_alive_across_ledger_advance() {
+        use soroban_sdk::testutils::Ledger as _;
+
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 1_000;
+            li.max_entry_ttl = 6_312_000;
+        });
+
+        let contract_id = env.register(ClPositionNft, ());
+        let client = ClPositionNftClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let pool = Address::generate(&env);
+        let user = Address::generate(&env);
+        client.initialize(&admin, &pool);
+
+        let id = client.mint(&user, &pool, &-100, &100);
+
+        // Advance well past the default persistent window, accessing the entry
+        // periodically. Each access bumps the TTL, so the next read stays live.
+        for _ in 0..3 {
+            env.ledger().with_mut(|li| li.sequence_number += 1_000_000);
+            assert_eq!(client.owner_of(&id), user);
+            assert_eq!(client.position_meta(&id).lower_tick, -100);
+            assert_eq!(client.tokens_of(&user).len(), 1);
+        }
     }
 }
