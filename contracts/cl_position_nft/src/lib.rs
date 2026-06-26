@@ -27,7 +27,6 @@ pub enum NftError {
     AlreadyInitialized = 1,
     Unauthorized       = 2,
     TokenNotFound      = 3,
-    // Reserved for the upcoming transfer / operator-approval work.
     NotOwnerOrApproved = 4,
     InvalidReceiver    = 5,
 }
@@ -48,7 +47,6 @@ pub enum DataKey {
     Approved(u64),
     /// Operator approval over all of an owner's tokens:
     /// `OperatorApproval(owner, operator) → bool`. Persistent.
-    /// Reserved for the upcoming transfer/operator work.
     OperatorApproval(Address, Address),
     /// Position metadata: `TokenPosition(token_id) → PositionMeta`. Persistent.
     TokenPosition(u64),
@@ -233,30 +231,125 @@ impl ClPositionNft {
         Self::tokens_of(env, owner).len()
     }
 
-    /// Returns the total number of tokens ever minted.
+    /// Returns the total number of tokens ever minted (cumulative; not reduced by burns).
     pub fn total_supply(env: Env) -> u64 {
         Self::next_token_id(env)
     }
 
-    /// Approve `approved` to transfer `token_id`. Only callable by the owner.
+    /// Approve `approved` to transfer `token_id`. Callable by the token owner or an approved operator.
     pub fn approve(
         env: Env,
         caller: Address,
-        token_id: u64,
         approved: Address,
+        token_id: u64,
     ) -> Result<(), NftError> {
+        caller.require_auth();
         let owner: Address = env
             .storage()
             .persistent()
             .get(&DataKey::Owner(token_id))
             .ok_or(NftError::TokenNotFound)?;
-        if caller != owner {
+
+        let is_owner = caller == owner;
+        let is_operator = Self::is_approved_for_all(env.clone(), owner.clone(), caller.clone());
+        if !is_owner && !is_operator {
             return Err(NftError::Unauthorized);
         }
-        caller.require_auth();
+
         env.storage()
             .persistent()
             .set(&DataKey::Approved(token_id), &approved);
+
+        env.events()
+            .publish((soroban_sdk::Symbol::new(&env, "approve"), caller, approved), token_id);
+
+        Ok(())
+    }
+
+    /// Set operator approval for all tokens owned by `owner`.
+    pub fn set_approval_for_all(
+        env: Env,
+        owner: Address,
+        operator: Address,
+        approved: bool,
+    ) {
+        owner.require_auth();
+        env.storage()
+            .persistent()
+            .set(&DataKey::OperatorApproval(owner.clone(), operator.clone()), &approved);
+        env.events()
+            .publish((soroban_sdk::Symbol::new(&env, "approval_for_all"), owner, operator), approved);
+    }
+
+    /// Check if `operator` is approved for all tokens of `owner`.
+    pub fn is_approved_for_all(env: Env, owner: Address, operator: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::OperatorApproval(owner, operator))
+            .unwrap_or(false)
+    }
+
+    /// Transfer `token_id` from `from` to `to`.
+    /// Caller must be `from`, hold an approval for `token_id`, or be an approved operator for `from`.
+    pub fn transfer(
+        env: Env,
+        caller: Address,
+        from: Address,
+        to: Address,
+        token_id: u64,
+    ) -> Result<(), NftError> {
+        caller.require_auth();
+
+        let owner: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Owner(token_id))
+            .ok_or(NftError::TokenNotFound)?;
+
+        if owner != from {
+            return Err(NftError::Unauthorized);
+        }
+
+        let is_owner = caller == from;
+        let is_approved = Self::get_approved(env.clone(), token_id).map(|a| a == caller).unwrap_or(false);
+        let is_operator = Self::is_approved_for_all(env.clone(), from.clone(), caller.clone());
+
+        if !is_owner && !is_approved && !is_operator {
+            return Err(NftError::NotOwnerOrApproved);
+        }
+
+        // Update Owner
+        env.storage().persistent().set(&DataKey::Owner(token_id), &to);
+
+        // Clear Approved
+        env.storage().persistent().remove(&DataKey::Approved(token_id));
+
+        // Update from OwnedTokens
+        let from_key = DataKey::OwnedTokens(from.clone());
+        let mut from_owned: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&from_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if let Some(idx) = from_owned.iter().position(|id| id == token_id) {
+            from_owned.remove(idx as u32);
+            env.storage().persistent().set(&from_key, &from_owned);
+        }
+
+        // Update to OwnedTokens
+        let to_key = DataKey::OwnedTokens(to.clone());
+        let mut to_owned: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&to_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        to_owned.push_back(token_id);
+        env.storage().persistent().set(&to_key, &to_owned);
+
+        // Emit transfer event
+        env.events()
+            .publish((soroban_sdk::Symbol::new(&env, "transfer"), from, to), token_id);
+
         Ok(())
     }
 
@@ -372,7 +465,7 @@ mod tests {
         // Mint then set an approval to verify it is also cleared.
         let id = client.mint(&user, &pool, &-100, &100);
         let approved_addr = Address::generate(&env);
-        client.approve(&user, &id, &approved_addr);
+        client.approve(&user, &approved_addr, &id);
         assert_eq!(client.get_approved(&id), Some(approved_addr));
 
         client.burn(&id);
@@ -474,9 +567,11 @@ mod tests {
         assert!(b_owned.iter().any(|id| id == id1));
     }
 
+    // ── balance_of / total_supply ──────────────────────────────────────────────
+
     #[test]
     fn balance_of_tracks_mint_and_burn() {
-        let (env, client, _admin, pool, user) = setup();
+        let (_env, client, _admin, pool, user) = setup();
         assert_eq!(client.balance_of(&user), 0);
 
         let id = client.mint(&user, &pool, &-100, &100);
@@ -488,17 +583,86 @@ mod tests {
 
     #[test]
     fn total_supply_tracks_all_mints() {
-        let (env, client, _admin, pool, user) = setup();
+        let (_env, client, _admin, pool, user) = setup();
         assert_eq!(client.total_supply(), 0);
 
         let id0 = client.mint(&user, &pool, &-100, &100);
         assert_eq!(client.total_supply(), 1);
 
-        let id1 = client.mint(&user, &pool, &-200, &200);
+        client.mint(&user, &pool, &-200, &200);
         assert_eq!(client.total_supply(), 2);
 
         client.burn(&id0);
-        // Burning does not decrease total_supply
+        // Burning does not decrease total_supply.
         assert_eq!(client.total_supply(), 2);
+    }
+
+    // ── transfer and approval ──────────────────────────────────────────────────
+
+    #[test]
+    fn transfer_happy_path() {
+        let (env, client, _admin, pool, user_a) = setup();
+        let user_b = Address::generate(&env);
+        let id = client.mint(&user_a, &pool, &-100, &100);
+
+        client.transfer(&user_a, &user_a, &user_b, &id);
+
+        assert_eq!(client.owner_of(&id), user_b);
+        assert_eq!(client.tokens_of(&user_a).len(), 0);
+        let b_tokens = client.tokens_of(&user_b);
+        assert_eq!(b_tokens.len(), 1);
+        assert_eq!(b_tokens.get(0).unwrap(), id);
+    }
+
+    #[test]
+    fn approve_then_transfer_clears_approval() {
+        let (env, client, _admin, pool, user_a) = setup();
+        let operator = Address::generate(&env);
+        let user_b = Address::generate(&env);
+        let id = client.mint(&user_a, &pool, &-100, &100);
+
+        client.approve(&user_a, &operator, &id);
+        assert_eq!(client.get_approved(&id), Some(operator.clone()));
+
+        client.transfer(&operator, &user_a, &user_b, &id);
+
+        assert_eq!(client.owner_of(&id), user_b);
+        assert_eq!(client.get_approved(&id), None); // Approval must be cleared
+    }
+
+    #[test]
+    fn operator_can_transfer() {
+        let (env, client, _admin, pool, user_a) = setup();
+        let operator = Address::generate(&env);
+        let user_b = Address::generate(&env);
+        let id = client.mint(&user_a, &pool, &-100, &100);
+
+        client.set_approval_for_all(&user_a, &operator, &true);
+        assert_eq!(client.is_approved_for_all(&user_a, &operator), true);
+
+        client.transfer(&operator, &user_a, &user_b, &id);
+
+        assert_eq!(client.owner_of(&id), user_b);
+    }
+
+    #[test]
+    fn unauthorized_transfer_fails() {
+        let (env, client, _admin, pool, user_a) = setup();
+        let unauthorized = Address::generate(&env);
+        let user_b = Address::generate(&env);
+        let id = client.mint(&user_a, &pool, &-100, &100);
+
+        let res = client.try_transfer(&unauthorized, &user_a, &user_b, &id);
+        assert_eq!(res.unwrap_err().unwrap(), NftError::NotOwnerOrApproved);
+    }
+
+    #[test]
+    fn transfer_from_wrong_owner_fails() {
+        let (env, client, _admin, pool, user_a) = setup();
+        let user_b = Address::generate(&env);
+        let id = client.mint(&user_a, &pool, &-100, &100);
+
+        let res = client.try_transfer(&user_a, &user_b, &user_b, &id);
+        assert_eq!(res.unwrap_err().unwrap(), NftError::Unauthorized);
     }
 }
