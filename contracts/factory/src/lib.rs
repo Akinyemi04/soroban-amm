@@ -725,7 +725,11 @@ impl Factory {
 
     /// Return the addresses of every pool deployed by this factory.
     pub fn all_pools(env: Env) -> Vec<Address> {
-        let count: u64 = env.storage().instance().get(&DataKey::PoolCount).unwrap_or(0);
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolCount)
+            .unwrap_or(0);
         let mut all = Vec::new(&env);
         for i in 0..count {
             if let Some(pool) = env.storage().persistent().get(&DataKey::PoolByIndex(i)) {
@@ -745,7 +749,11 @@ impl Factory {
 
     /// Return up to `limit` pool addresses starting at `offset`.
     pub fn get_pools(env: Env, offset: u32, limit: u32) -> Vec<Address> {
-        let count: u64 = env.storage().instance().get(&DataKey::PoolCount).unwrap_or(0);
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolCount)
+            .unwrap_or(0);
         let start = (offset as u64).min(count);
         let end = (start + limit as u64).min(count);
 
@@ -935,7 +943,11 @@ impl Factory {
             .ok_or(FactoryError::FeeNotConfigured)?;
 
         let factory_addr = env.current_contract_address();
-        let count: u64 = env.storage().instance().get(&DataKey::PoolCount).unwrap_or(0);
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolCount)
+            .unwrap_or(0);
 
         let start = (offset as u64).min(count);
         let end = (start + limit as u64).min(count);
@@ -943,7 +955,11 @@ impl Factory {
         let mut total_collected: i128 = 0;
 
         for i in start..end {
-            if let Some(pool_addr) = env.storage().persistent().get::<DataKey, Address>(&DataKey::PoolByIndex(i)) {
+            if let Some(pool_addr) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Address>(&DataKey::PoolByIndex(i))
+            {
                 // Skip governance-controlled pools.
                 let gov: Option<Option<Address>> = env
                     .storage()
@@ -1011,7 +1027,10 @@ impl Factory {
     // ── Internals ─────────────────────────────────────────────────────────────
 
     fn pool_count(env: &Env) -> u32 {
-        env.storage().instance().get(&DataKey::PoolCount).unwrap_or(0u64) as u32
+        env.storage()
+            .instance()
+            .get(&DataKey::PoolCount)
+            .unwrap_or(0u64) as u32
     }
 
     fn require_admin(env: &Env, admin: &Address) -> Result<(), FactoryError> {
@@ -1045,14 +1064,22 @@ impl Factory {
         limit: u32,
     ) -> u32 {
         let factory_addr = env.current_contract_address();
-        let count: u64 = env.storage().instance().get(&DataKey::PoolCount).unwrap_or(0);
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolCount)
+            .unwrap_or(0);
 
         let start = (offset as u64).min(count);
         let end = (start + limit as u64).min(count);
         let mut updated: u32 = 0;
 
         for i in start..end {
-            if let Some(pool_addr) = env.storage().persistent().get::<DataKey, Address>(&DataKey::PoolByIndex(i)) {
+            if let Some(pool_addr) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Address>(&DataKey::PoolByIndex(i))
+            {
                 // Governance-controlled pools have their own pool admin contract,
                 // so the factory cannot authorize their pool-level fee update.
                 let gov: Option<Option<Address>> = env
