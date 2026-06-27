@@ -457,6 +457,18 @@ impl AmmPool {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
+        // If a k-of-n multisig guard is configured, the single-admin path must
+        // not be allowed to drain reserves. Callers must use the multisig flow
+        // (propose_emergency_withdraw / exec_multisig_emergency_wd) instead.
+        let quorum: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigQuorum)
+            .unwrap_or(0);
+        if quorum > 0 {
+            return Err(AmmError::Unauthorized);
+        }
+
         // Record audit information
         let ts: u64 = env.ledger().timestamp();
         env.storage()
