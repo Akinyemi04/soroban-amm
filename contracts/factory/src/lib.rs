@@ -100,7 +100,7 @@ pub trait GovernanceInterface {
 pub enum DataKey {
     Pool(Address, Address), // normalized (token_a, token_b) → pool Address
     LpToken(Address),       // pool address → LP token address
-    AllPools,               // Vec<Address> of every deployed pool
+    PoolByIndex(u64),       // u64 index -> pool Address
     Admin,
     AmmWasmHash,
     TokenWasmHash,
@@ -171,7 +171,7 @@ impl Factory {
             .set(&DataKey::TokenWasmHash, &token_wasm_hash);
         env.storage()
             .instance()
-            .set(&DataKey::AllPools, &Vec::<Address>::new(&env));
+            .set(&DataKey::TokenWasmHash, &token_wasm_hash);
         env.storage().instance().set(&DataKey::PoolCount, &0u64);
         // Initialize default fee tier to Medium (0.3% = 30 bps)
         env.storage()
@@ -346,13 +346,9 @@ impl Factory {
             &(ta.clone(), tb.clone()),
         );
 
-        let mut all: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::AllPools)
-            .unwrap_or_else(|| Vec::new(&env));
-        all.push_back(pool_addr.clone());
-        env.storage().instance().set(&DataKey::AllPools, &all);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PoolByIndex(n), &pool_addr);
 
         soroban_amm_sdk::emit_versioned_event!(
             env,
@@ -561,13 +557,9 @@ impl Factory {
 
         env.storage().instance().set(&cl_key, &pool_addr);
 
-        let mut all: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::AllPools)
-            .unwrap_or_else(|| Vec::new(&env));
-        all.push_back(pool_addr.clone());
-        env.storage().instance().set(&DataKey::AllPools, &all);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PoolByIndex(n), &pool_addr);
 
         soroban_amm_sdk::emit_versioned_event!(
             env,
@@ -733,10 +725,14 @@ impl Factory {
 
     /// Return the addresses of every pool deployed by this factory.
     pub fn all_pools(env: Env) -> Vec<Address> {
-        env.storage()
-            .instance()
-            .get(&DataKey::AllPools)
-            .unwrap_or_else(|| Vec::new(&env))
+        let count: u64 = env.storage().instance().get(&DataKey::PoolCount).unwrap_or(0);
+        let mut all = Vec::new(&env);
+        for i in 0..count {
+            if let Some(pool) = env.storage().persistent().get(&DataKey::PoolByIndex(i)) {
+                all.push_back(pool);
+            }
+        }
+        all
     }
 
     /// Return the total number of pools deployed by this factory.
@@ -749,18 +745,13 @@ impl Factory {
 
     /// Return up to `limit` pool addresses starting at `offset`.
     pub fn get_pools(env: Env, offset: u32, limit: u32) -> Vec<Address> {
-        let all: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::AllPools)
-            .unwrap_or_else(|| Vec::new(&env));
-        let len = all.len();
-        let start = offset.min(len);
-        let end = (start + limit).min(len);
+        let count: u64 = env.storage().instance().get(&DataKey::PoolCount).unwrap_or(0);
+        let start = (offset as u64).min(count);
+        let end = (start + limit as u64).min(count);
 
         let mut page = Vec::new(&env);
         for i in start..end {
-            if let Some(pool) = all.get(i) {
+            if let Some(pool) = env.storage().persistent().get(&DataKey::PoolByIndex(i)) {
                 page.push_back(pool);
             }
         }
@@ -944,20 +935,15 @@ impl Factory {
             .ok_or(FactoryError::FeeNotConfigured)?;
 
         let factory_addr = env.current_contract_address();
-        let all: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::AllPools)
-            .unwrap_or_else(|| Vec::new(env));
+        let count: u64 = env.storage().instance().get(&DataKey::PoolCount).unwrap_or(0);
 
-        let len = all.len();
-        let start = offset.min(len);
-        let end = (start + limit).min(len);
+        let start = (offset as u64).min(count);
+        let end = (start + limit as u64).min(count);
         let mut pools_swept: u32 = 0;
         let mut total_collected: i128 = 0;
 
         for i in start..end {
-            if let Some(pool_addr) = all.get(i) {
+            if let Some(pool_addr) = env.storage().persistent().get::<DataKey, Address>(&DataKey::PoolByIndex(i)) {
                 // Skip governance-controlled pools.
                 let gov: Option<Option<Address>> = env
                     .storage()
@@ -1025,12 +1011,7 @@ impl Factory {
     // ── Internals ─────────────────────────────────────────────────────────────
 
     fn pool_count(env: &Env) -> u32 {
-        let all: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::AllPools)
-            .unwrap_or_else(|| Vec::new(env));
-        all.len()
+        env.storage().instance().get(&DataKey::PoolCount).unwrap_or(0u64) as u32
     }
 
     fn require_admin(env: &Env, admin: &Address) -> Result<(), FactoryError> {
@@ -1064,19 +1045,14 @@ impl Factory {
         limit: u32,
     ) -> u32 {
         let factory_addr = env.current_contract_address();
-        let all: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::AllPools)
-            .unwrap_or_else(|| Vec::new(env));
+        let count: u64 = env.storage().instance().get(&DataKey::PoolCount).unwrap_or(0);
 
-        let len = all.len();
-        let start = offset.min(len);
-        let end = (start + limit).min(len);
+        let start = (offset as u64).min(count);
+        let end = (start + limit as u64).min(count);
         let mut updated: u32 = 0;
 
         for i in start..end {
-            if let Some(pool_addr) = all.get(i) {
+            if let Some(pool_addr) = env.storage().persistent().get::<DataKey, Address>(&DataKey::PoolByIndex(i)) {
                 // Governance-controlled pools have their own pool admin contract,
                 // so the factory cannot authorize their pool-level fee update.
                 let gov: Option<Option<Address>> = env
