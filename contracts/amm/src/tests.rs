@@ -1179,6 +1179,25 @@ fn test_fee_bps_max_succeeds() {
     assert_eq!(result.unwrap().unwrap(), 0);
 }
 
+#[test]
+fn test_get_amount_in_max_fee_does_not_panic() {
+    // With fee_bps=10_000 the `(10_000 - fee_bps)` divisor is zero. The quote
+    // must return 0 instead of trapping on a division by zero.
+    let ts = setup_pool(10_000);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    let quoted_in = amm.get_amount_in(&ts.tb_addr, &1_000);
+    assert_eq!(quoted_in, 0);
+}
+
 // ── Edge cases: minimum share precision ───────────────────────────────────────
 
 #[test]

@@ -2320,6 +2320,12 @@ impl AmmPool {
         };
         assert!(reserve_in > 0 && reserve_out > 0, "zero reserve");
         assert!(amount_out < reserve_out, "amount_out >= reserve_out");
+        // Defensive guard for any pool created before the tightened fee bound:
+        // a 100% fee makes the `(10_000 - fee_bps)` divisor zero. A swap can
+        // never return any output in that case, so the input is unquotable.
+        if fee_bps >= 10_000 {
+            return 0;
+        }
         (reserve_in * amount_out * 10_000) / ((reserve_out - amount_out) * (10_000 - fee_bps)) + 1
     }
 
