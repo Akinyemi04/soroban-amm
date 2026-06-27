@@ -1446,6 +1446,9 @@ impl ConcentratedLiquidity {
                 let sqrt_p = Self::sqrt(price);
                 (sqrt_p as u128) * (1u128 << 96) / 1000u128
             });
+        // Snapshot the price before the tick walk so we can tell whether the
+        // swap actually moved it (issue #352).
+        let sqrt_price_before = sqrt_price_x96;
 
         while amount_remaining > 0 {
             let next_tick_opt = Self::next_initialized_tick(&env, current_tick, zero_for_one);
@@ -1698,6 +1701,20 @@ impl ConcentratedLiquidity {
                 current_tick,
             )
         );
+
+        // Issue #352: dedicated price-movement signal keyed by the token pair.
+        // The `swap` event above is keyed by `sender`, which forces indexers
+        // (TWAP oracle, incentive campaigns) tracking a specific pool to scan
+        // every sender's events. This event lets them subscribe by token pair
+        // and react to price changes without polling storage each ledger. It is
+        // only emitted when the swap actually moved the price.
+        if sqrt_price_x96 != sqrt_price_before {
+            soroban_amm_sdk::emit_versioned_event!(
+                env,
+                (symbol_short!("price_upd"), token_in, token_out),
+                (amount_in_actual, amount_out_total, sqrt_price_x96, current_tick)
+            );
+        }
 
         Ok(amount_out_total)
     }
@@ -2820,6 +2837,41 @@ mod tests {
         assert_eq!(__ver_4.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
         let data: (i32, i32, i128, i128) = __ver_4.1;
         assert_eq!(data, (0_i32, 150_i32, total_a, total_b));
+    }
+
+    /// Issue #352: a price-moving swap emits a `price_upd` event keyed by the
+    /// token pair, carrying the input/output amounts and the new price + tick.
+    #[test]
+    fn swap_emits_price_upd_event() {
+        let env = Env::default();
+        let te = setup_test_env(&env, 30, 0);
+        let cl_addr = te.cl_addr.clone();
+
+        te.client
+            .mint_position(&te.provider, &-100, &100, &100_000, &100_000, &0, &0);
+
+        // zero_for_one = true → token_in = token_a, token_out = token_b.
+        let amount_out = te.client.swap(&te.provider, &true, &1_000, &0, &0, &u64::MAX);
+        assert!(amount_out > 0);
+
+        let state = te.client.get_pool_state();
+
+        use soroban_sdk::{testutils::Events as _, IntoVal, Val, Vec as SdkVec};
+        let expected_topics: SdkVec<Val> =
+            (symbol_short!("price_upd"), te.token_a.clone(), te.token_b.clone()).into_val(&env);
+        let event = env
+            .events()
+            .all()
+            .iter()
+            .find(|e| e.0 == cl_addr && e.1 == expected_topics)
+            .expect("price_upd event must be emitted on a price-moving swap");
+        let decoded: (u32, (i128, i128, u128, i32)) = event.2.into_val(&env);
+        assert_eq!(decoded.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        let (amount_in_used, amount_out_emitted, new_sqrt_price, new_tick) = decoded.1;
+        assert!(amount_in_used > 0);
+        assert_eq!(amount_out_emitted, amount_out);
+        assert_eq!(new_sqrt_price, state.sqrt_price);
+        assert_eq!(new_tick, state.current_tick);
     }
 
     #[test]
