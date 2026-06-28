@@ -151,7 +151,7 @@ impl<'a> Fixture<'a> {
         // ── Migration contract ─────────────────────────────────────────────────
         let migration_addr = env.register_contract(None, MigrationContract);
         let migration = MigrationContractClient::new(env, &migration_addr);
-        migration.initialize(&admin, &v2_addr, &v3_addr).unwrap();
+        migration.initialize(&admin, &v2_addr, &v3_addr);
 
         Fixture {
             env: env.clone(),
@@ -184,7 +184,7 @@ fn test_happy_path_migrate_returns_v3_position() {
         &500_i32,
         &0_i128,
         &DEADLINE,
-    ).unwrap();
+    );
 
     // V3 position was created (mock returns 42)
     assert_eq!(result.position_id, 42_i128);
@@ -235,9 +235,8 @@ fn test_zero_shares_reverts() {
         &i32::MIN, &i32::MAX, &500_i32, &0_i128, &DEADLINE,
     );
 
-    assert_eq!(
-        result,
-        Err(Ok(MigrationError::ZeroShares)),
+    assert!(
+        matches!(result, Err(Ok(MigrationError::ZeroShares))),
         "should return ZeroShares error"
     );
 }
@@ -251,19 +250,18 @@ fn test_invalid_range_preview_reverts() {
 
     // Explicit ticks where lower >= upper
     let result = f.migration.try_preview_range(&100_i32, &50_i32, &0_i32);
-    assert_eq!(
-        result,
-        Err(Ok(MigrationError::InvalidRange)),
+    assert!(
+        matches!(result, Err(Ok(MigrationError::InvalidRange))),
         "lower_tick >= upper_tick should return InvalidRange"
     );
 
     // Equal ticks also invalid
     let result2 = f.migration.try_preview_range(&100_i32, &100_i32, &0_i32);
-    assert_eq!(result2, Err(Ok(MigrationError::InvalidRange)));
+    assert!(matches!(result2, Err(Ok(MigrationError::InvalidRange))));
 
     // Auto-range with range_width_ticks = 0 is also invalid
     let result3 = f.migration.try_preview_range(&i32::MIN, &i32::MAX, &0_i32);
-    assert_eq!(result3, Err(Ok(MigrationError::InvalidRange)));
+    assert!(matches!(result3, Err(Ok(MigrationError::InvalidRange))));
 }
 
 // ── Test 5: Dust returned to LP ───────────────────────────────────────────────
@@ -281,7 +279,7 @@ fn test_dust_returned_to_lp() {
         &f.lp, &lp_shares,
         &0_i128, &0_i128,
         &i32::MIN, &i32::MAX, &500_i32, &0_i128, &DEADLINE,
-    ).unwrap();
+    );
 
     let returned_a = f.token_a.balance(&f.lp) - before_a;
     let returned_b = f.token_b.balance(&f.lp) - before_b;
@@ -342,7 +340,7 @@ fn test_unauthorized_pool_pair_reverts() {
 
     let migration_addr = env.register_contract(None, MigrationContract);
     let migration = MigrationContractClient::new(&env, &migration_addr);
-    migration.initialize(&admin, &v2_addr, &v3_bad_addr).unwrap();
+    migration.initialize(&admin, &v2_addr, &v3_bad_addr);
 
     let shares = LpTokenClient::new(&env, &v2_lp_addr).balance(&lp);
 
@@ -366,8 +364,7 @@ fn test_preview_range_matches_migrate() {
 
     // Preview using auto-range with width 500
     let (preview_lower, preview_upper) = f.migration
-        .preview_range(&i32::MIN, &i32::MAX, &500_i32)
-        .unwrap();
+        .preview_range(&i32::MIN, &i32::MAX, &500_i32);
 
     assert!(preview_lower < preview_upper, "preview_range must return valid range");
 
@@ -376,7 +373,7 @@ fn test_preview_range_matches_migrate() {
         &f.lp, &lp_shares,
         &0_i128, &0_i128,
         &i32::MIN, &i32::MAX, &500_i32, &0_i128, &DEADLINE,
-    ).unwrap();
+    );
 
     assert_eq!(result.tick_lower, preview_lower, "migrate tick_lower must match preview_range");
     assert_eq!(result.tick_upper, preview_upper, "migrate tick_upper must match preview_range");
