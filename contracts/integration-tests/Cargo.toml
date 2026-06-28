@@ -1,0 +1,23 @@
+[package]
+name = "integration-tests"
+version = "0.1.0"
+edition = "2021"
+
+# Integration tests only; no library target.
+[lib]
+name = "integration_tests"
+path = "src/lib.rs"
+
+[[test]]
+name = "v2_to_v3_migration"
+path = "tests/v2_to_v3_migration.rs"
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+token = { path = "../token", features = ["testutils"] }
+amm = { path = "../amm", features = ["testutils"] }
+concentrated_liquidity = { path = "../concentrated_liquidity", features = ["testutils"] }
+v2_to_v3_migration = { path = "../v2_to_v3_migration", features = ["testutils"] }

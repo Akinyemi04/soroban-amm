@@ -1,0 +1,22 @@
+[package]
+name = "v2_to_v3_migration"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+testutils = ["soroban-sdk/testutils", "token/testutils", "amm/testutils", "concentrated_liquidity/testutils"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+token = { path = "../token" }
+amm = { path = "../amm" }
+concentrated_liquidity = { path = "../concentrated_liquidity" }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+token = { path = "../token", features = ["testutils"] }
+amm = { path = "../amm", features = ["testutils"] }
+concentrated_liquidity = { path = "../concentrated_liquidity", features = ["testutils"] }
