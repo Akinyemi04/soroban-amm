@@ -3,6 +3,8 @@ resolver = "2"
 members = [
   "contracts/amm",
   "contracts/token",
+  "contracts/concentrated_liquidity",
+  "contracts/amm-fuzz",
 ]
 
 [workspace.dependencies]
