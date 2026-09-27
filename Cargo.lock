@@ -194,6 +194,7 @@ dependencies = [
  "batch_auction",
  "cl_position_nft",
  "concentrated_liquidity",
+ "dex_aggregator",
  "factory",
  "governance",
  "incentive_campaigns",

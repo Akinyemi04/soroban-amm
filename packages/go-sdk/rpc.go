@@ -87,7 +87,9 @@ func (c *Client) call(ctx context.Context, method string, params interface{}, ou
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("%w: %s: %v", ErrRPC, method, err)
+		// Wrap the transport error as well, so callers can tell a cancelled or
+		// timed-out context apart from an endpoint failure with errors.Is.
+		return fmt.Errorf("%w: %s: %w", ErrRPC, method, err)
 	}
 	defer resp.Body.Close()
 

@@ -3,13 +3,16 @@ use std::{env as std_env, fs, process};
 use amm::{AmmPool, AmmPoolClient};
 use batch_auction::{BatchAuction, BatchAuctionClient};
 use concentrated_liquidity::{ConcentratedLiquidity, ConcentratedLiquidityClient};
+use dex_aggregator::{DexAggregator, DexAggregatorClient};
+use factory::{Factory, FactoryClient};
 use governance::{Governance, GovernanceClient, ProposalKind, Vote};
 use incentive_campaigns::{IncentiveCampaigns, IncentiveCampaignsClient};
+use router::{Router, RouterClient};
 use soroban_sdk::{
     contract, contractimpl, contracttype,
     testutils::{Address as _, Ledger},
     token::{StellarAssetClient, TokenClient as StellarTokenClient},
-    Address, Bytes, Env, String as SorobanString,
+    Address, Bytes, BytesN, Env, String as SorobanString, Vec as SorobanVec,
 };
 use staking::{Staking, StakingClient};
 use token::{LpToken, LpTokenClient};
@@ -19,7 +22,7 @@ const BASELINE_PATH: &str = "benches/baseline.json";
 
 #[derive(Clone)]
 struct Metric {
-    name: &'static str,
+    name: String,
     cpu_instructions: u64,
     mem_bytes: u64,
 }
@@ -123,7 +126,7 @@ fn main() {
 }
 
 fn run_all() -> Vec<Metric> {
-    vec![
+    let mut metrics = vec![
         measure("amm.swap", bench_amm_swap),
         measure("amm.add_liquidity", bench_amm_add_liquidity),
         measure("amm.remove_liquidity", bench_amm_remove_liquidity),
@@ -140,10 +143,55 @@ fn run_all() -> Vec<Metric> {
             "incentive_campaigns.claim_rewards",
             bench_incentive_claim_rewards,
         ),
-    ]
+    ];
+
+    // Paths whose cost scales with input size are measured at several sizes so
+    // the baseline records the slope, not just a single point.
+    for hops in HOP_COUNTS {
+        metrics.push(measure(
+            format!("router.swap_exact_in.hops_{hops}"),
+            move |env| bench_router_swap_exact_in(env, hops),
+        ));
+    }
+    for hops in HOP_COUNTS {
+        metrics.push(measure(
+            format!("dex_aggregator.execute_route.hops_{hops}"),
+            move |env| bench_aggregator_execute_route(env, hops),
+        ));
+    }
+    metrics.push(measure(
+        "dex_aggregator.swap_best.hops_2",
+        bench_aggregator_swap_best,
+    ));
+    for ticks in TICK_CROSSINGS {
+        metrics.push(measure(
+            format!("cl.swap_exact_out.ticks_{ticks}"),
+            move |env| bench_cl_swap_exact_out(env, ticks),
+        ));
+    }
+    for ticks in TICK_CROSSINGS {
+        metrics.push(measure(
+            format!("cl.burn_position.ticks_{ticks}"),
+            move |env| bench_cl_burn_position(env, ticks),
+        ));
+    }
+    for ticks in TICK_CROSSINGS {
+        metrics.push(measure(
+            format!("cl.collect_fees.ticks_{ticks}"),
+            move |env| bench_cl_collect_fees(env, ticks),
+        ));
+    }
+    metrics.push(measure("factory.create_pool", bench_factory_create_pool));
+    metrics
 }
 
-fn measure(name: &'static str, f: fn(&Env)) -> Metric {
+/// Hop counts measured for multi-hop routing (router and aggregator).
+const HOP_COUNTS: [u32; 3] = [1, 2, 3];
+/// Number of initialized ticks crossed for the tick-walk-dependent CL paths.
+const TICK_CROSSINGS: [i32; 3] = [1, 4, 8];
+
+fn measure(name: impl Into<String>, f: impl FnOnce(&Env)) -> Metric {
+    let name = name.into();
     eprintln!("running {name}");
     let env = Env::default();
     env.mock_all_auths();
@@ -467,6 +515,212 @@ fn bench_batch_settle(env: &Env) {
     let _ = auction.try_settle_batch();
 }
 
+// ── Concentrated liquidity: tick-walk-dependent paths ─────────────────────────
+
+/// Seed a CL pool with a wide base position plus `ticks` nested ladder
+/// positions `[-10i, 10i]`, so a zero-for-one swap that moves the price below
+/// `-10 * ticks` crosses exactly `ticks` initialized ticks. Returns the client
+/// and the provider that owns every position.
+fn setup_cl_ladder(env: &Env, ticks: i32) -> (ConcentratedLiquidityClient<'_>, Address) {
+    let (client, provider, _, _) = setup_cl(env);
+    client.mint_position(
+        &provider,
+        &-2_000,
+        &2_000,
+        &1_000_000,
+        &1_000_000,
+        &0,
+        &0,
+        &u64::MAX,
+    );
+    for i in 1..=ticks {
+        client.mint_position(
+            &provider,
+            &(-10 * i),
+            &(10 * i),
+            &20_000,
+            &20_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
+    }
+    (client, provider)
+}
+
+/// Sqrt-price limit just past the last ladder tick, so a swap stops after
+/// crossing every one of them and no further.
+fn cl_ladder_limit(ticks: i32) -> u128 {
+    ConcentratedLiquidity::tick_to_sqrt_price_x96(-10 * ticks - 5)
+}
+
+/// Swap zero-for-one across every ladder tick so positions accrue fees and the
+/// crossed ticks' fee-growth-outside values are flipped.
+fn cross_cl_ladder(client: &ConcentratedLiquidityClient<'_>, provider: &Address, ticks: i32) {
+    client.swap(
+        provider,
+        &true,
+        &1_000_000,
+        &cl_ladder_limit(ticks),
+        &0,
+        &u64::MAX,
+    );
+    assert!(
+        client.get_pool_state().current_tick < -10 * ticks,
+        "ladder swap did not cross all {ticks} ticks"
+    );
+}
+
+fn bench_cl_swap_exact_out(env: &Env, ticks: i32) {
+    // Learn how much output a swap to the ladder limit produces on an
+    // identical pool, then request slightly less of it, so the measured
+    // exact-out walk crosses the same initialized ticks.
+    let probe_env = Env::default();
+    probe_env.mock_all_auths();
+    probe_env.budget().reset_unlimited();
+    let (probe, probe_provider) = setup_cl_ladder(&probe_env, ticks);
+    let full_out = probe.swap(
+        &probe_provider,
+        &true,
+        &1_000_000,
+        &cl_ladder_limit(ticks),
+        &0,
+        &u64::MAX,
+    );
+    let amount_out = full_out * 95 / 100;
+
+    let (client, provider) = setup_cl_ladder(env, ticks);
+    env.budget().reset_default();
+    client.swap_exact_out(&provider, &true, &amount_out, &0, &i128::MAX, &u64::MAX);
+}
+
+fn bench_cl_burn_position(env: &Env, ticks: i32) {
+    let (client, provider) = setup_cl_ladder(env, ticks);
+    cross_cl_ladder(&client, &provider, ticks);
+    let liquidity = client
+        .get_position(&provider, &(-10 * ticks), &(10 * ticks))
+        .liquidity;
+    env.budget().reset_default();
+    client.burn_position(&provider, &(-10 * ticks), &(10 * ticks), &liquidity);
+}
+
+fn bench_cl_collect_fees(env: &Env, ticks: i32) {
+    let (client, provider) = setup_cl_ladder(env, ticks);
+    cross_cl_ladder(&client, &provider, ticks);
+    env.budget().reset_default();
+    client.collect_fees(&provider, &-2_000, &2_000);
+}
+
+// ── Factory-deployed pools: router, aggregator, factory ───────────────────────
+
+/// A factory plus `hops` factory-deployed pools chained
+/// `tokens[0] → tokens[1] → … → tokens[hops]`, each seeded with liquidity.
+/// The trader holds a balance of `tokens[0]`.
+struct PoolChain<'a> {
+    factory: FactoryClient<'a>,
+    admin: Address,
+    trader: Address,
+    tokens: SorobanVec<Address>,
+}
+
+/// A factory with the real AMM and LP-token WASM uploaded, so pools it deploys
+/// run in the metered VM exactly as they would on-chain.
+fn setup_factory(env: &Env) -> (FactoryClient<'_>, Address) {
+    let admin = Address::generate(env);
+    let amm_hash: BytesN<32> = env.deployer().upload_contract_wasm(amm::WASM);
+    let lp_hash: BytesN<32> = env.deployer().upload_contract_wasm(token::WASM);
+    let factory_addr = env.register_contract(None, Factory);
+    let factory = FactoryClient::new(env, &factory_addr);
+    factory.initialize(&admin, &amm_hash, &lp_hash);
+    (factory, admin)
+}
+
+fn setup_pool_chain(env: &Env, hops: u32) -> PoolChain<'_> {
+    let (factory, admin) = setup_factory(env);
+    let lp = Address::generate(env);
+    let trader = Address::generate(env);
+    let mut tokens = SorobanVec::new(env);
+    for _ in 0..=hops {
+        let token = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        StellarAssetClient::new(env, &token).mint(&lp, &10_000_000);
+        tokens.push_back(token);
+    }
+    StellarAssetClient::new(env, &tokens.get(0).unwrap()).mint(&trader, &1_000_000);
+    for i in 0..hops {
+        let a = tokens.get(i).unwrap();
+        let b = tokens.get(i + 1).unwrap();
+        // fee_tier 2 = 30 bps; no governance contract.
+        let (pool, _) = factory.create_pool(&admin, &a, &b, &2_i128, &None);
+        AmmPoolClient::new(env, &pool).add_liquidity(&lp, &1_000_000, &1_000_000, &0, &u64::MAX);
+    }
+    PoolChain {
+        factory,
+        admin,
+        trader,
+        tokens,
+    }
+}
+
+fn bench_router_swap_exact_in(env: &Env, hops: u32) {
+    let chain = setup_pool_chain(env, hops);
+    let router_addr = env.register_contract(None, Router);
+    let router = RouterClient::new(env, &router_addr);
+    router.initialize(&chain.admin, &chain.factory.address);
+    env.budget().reset_default();
+    router.swap_exact_in(&chain.trader, &chain.tokens, &10_000, &0, &u64::MAX);
+}
+
+fn setup_aggregator<'a>(env: &'a Env, chain: &PoolChain<'a>) -> DexAggregatorClient<'a> {
+    let agg_addr = env.register_contract(None, DexAggregator);
+    let agg = DexAggregatorClient::new(env, &agg_addr);
+    agg.initialize(&chain.admin, &chain.factory.address);
+    // Intermediate tokens are the routing candidates the BFS may pass through.
+    let mut routing = SorobanVec::new(env);
+    for i in 1..chain.tokens.len() - 1 {
+        routing.push_back(chain.tokens.get(i).unwrap());
+    }
+    agg.set_routing_tokens(&routing);
+    agg
+}
+
+fn bench_aggregator_execute_route(env: &Env, hops: u32) {
+    let chain = setup_pool_chain(env, hops);
+    let agg = setup_aggregator(env, &chain);
+    let token_in = chain.tokens.get(0).unwrap();
+    let token_out = chain.tokens.get(hops).unwrap();
+    let route = agg.find_best_route(&token_in, &token_out, &10_000, &hops);
+    assert_eq!(
+        route.hops.len(),
+        hops,
+        "aggregator chose an unexpected route"
+    );
+    env.budget().reset_default();
+    agg.execute_route(&route, &chain.trader, &10_000, &0, &u64::MAX);
+}
+
+fn bench_aggregator_swap_best(env: &Env) {
+    let chain = setup_pool_chain(env, 2);
+    let agg = setup_aggregator(env, &chain);
+    let token_in = chain.tokens.get(0).unwrap();
+    let token_out = chain.tokens.get(2).unwrap();
+    env.budget().reset_default();
+    agg.swap_best(&chain.trader, &token_in, &token_out, &10_000, &0, &u64::MAX);
+}
+
+fn bench_factory_create_pool(env: &Env) {
+    let (factory, admin) = setup_factory(env);
+    let token_a = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    env.budget().reset_default();
+    factory.create_pool(&admin, &token_a, &token_b, &2_i128, &None);
+}
+
 fn parse_budget(text: &str) -> (u64, u64) {
     let mut cpu = 0;
     let mut mem = 0;
@@ -506,17 +760,17 @@ fn render_json(metrics: &[Metric]) -> String {
 
 fn check_regressions(metrics: &[Metric], baseline: &str) -> Result<(), String> {
     for metric in metrics {
-        let cpu = read_baseline_value(baseline, metric.name, "cpu_instructions")
+        let cpu = read_baseline_value(baseline, &metric.name, "cpu_instructions")
             .ok_or_else(|| format!("missing baseline CPU metric for {}", metric.name))?;
-        let mem = read_baseline_value(baseline, metric.name, "mem_bytes")
+        let mem = read_baseline_value(baseline, &metric.name, "mem_bytes")
             .ok_or_else(|| format!("missing baseline memory metric for {}", metric.name))?;
         assert_within(
-            metric.name,
+            &metric.name,
             "cpu_instructions",
             metric.cpu_instructions,
             cpu,
         )?;
-        assert_within(metric.name, "mem_bytes", metric.mem_bytes, mem)?;
+        assert_within(&metric.name, "mem_bytes", metric.mem_bytes, mem)?;
     }
     Ok(())
 }

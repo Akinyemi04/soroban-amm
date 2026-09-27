@@ -15,6 +15,7 @@ incentive_campaigns = { path = "../contracts/incentive_campaigns", features = ["
 cl_position_nft = { path = "../contracts/cl_position_nft", features = ["testutils"] }
 factory = { path = "../contracts/factory", features = ["testutils"] }
 router = { path = "../contracts/router", features = ["testutils"] }
+dex_aggregator = { path = "../contracts/dex_aggregator", features = ["testutils"] }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }

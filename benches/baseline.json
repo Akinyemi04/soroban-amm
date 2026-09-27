@@ -12,6 +12,23 @@
     { "name": "governance.execute", "cpu_instructions": 443313, "mem_bytes": 73571 },
     { "name": "staking.stake", "cpu_instructions": 552101, "mem_bytes": 85980 },
     { "name": "staking.claim", "cpu_instructions": 498383, "mem_bytes": 67892 },
-    { "name": "incentive_campaigns.claim_rewards", "cpu_instructions": 293108, "mem_bytes": 46121 }
+    { "name": "incentive_campaigns.claim_rewards", "cpu_instructions": 293108, "mem_bytes": 46121 },
+    { "name": "router.swap_exact_in.hops_1", "cpu_instructions": 11607925, "mem_bytes": 3406016 },
+    { "name": "router.swap_exact_in.hops_2", "cpu_instructions": 23207677, "mem_bytes": 6834879 },
+    { "name": "router.swap_exact_in.hops_3", "cpu_instructions": 34906311, "mem_bytes": 10296460 },
+    { "name": "dex_aggregator.execute_route.hops_1", "cpu_instructions": 11639719, "mem_bytes": 3409421 },
+    { "name": "dex_aggregator.execute_route.hops_2", "cpu_instructions": 23316662, "mem_bytes": 6852243 },
+    { "name": "dex_aggregator.execute_route.hops_3", "cpu_instructions": 35077123, "mem_bytes": 10349479 },
+    { "name": "dex_aggregator.swap_best.hops_2", "cpu_instructions": 85131143, "mem_bytes": 27009432 },
+    { "name": "cl.swap_exact_out.ticks_1", "cpu_instructions": 917165, "mem_bytes": 108363 },
+    { "name": "cl.swap_exact_out.ticks_4", "cpu_instructions": 1091248, "mem_bytes": 146245 },
+    { "name": "cl.swap_exact_out.ticks_8", "cpu_instructions": 1560659, "mem_bytes": 204609 },
+    { "name": "cl.burn_position.ticks_1", "cpu_instructions": 864951, "mem_bytes": 112956 },
+    { "name": "cl.burn_position.ticks_4", "cpu_instructions": 1054726, "mem_bytes": 152622 },
+    { "name": "cl.burn_position.ticks_8", "cpu_instructions": 1326010, "mem_bytes": 204678 },
+    { "name": "cl.collect_fees.ticks_1", "cpu_instructions": 591757, "mem_bytes": 83358 },
+    { "name": "cl.collect_fees.ticks_4", "cpu_instructions": 699034, "mem_bytes": 105504 },
+    { "name": "cl.collect_fees.ticks_8", "cpu_instructions": 859704, "mem_bytes": 135096 },
+    { "name": "factory.create_pool", "cpu_instructions": 15662384, "mem_bytes": 5231768 }
   ]
 }
